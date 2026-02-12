@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ream-moe"
+version = "0.1.0"
+description = "REAM-style Mixture-of-Experts compression framework with pluggable adapters (Qwen, gpt-oss, Kimi, etc.)"
+authors = [
+  { name = "Your Name", email = "you@example.com" },
+]
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "torch>=2.2,<3.0",
+  "transformers>=4.45,<5.0",
+  "scipy>=1.11,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/ream-moe"
+Repository = "https://github.com/your-org/ream-moe"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ream_moe*"]
+

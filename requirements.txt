@@ -1,0 +1,4 @@
+torch>=2.2,<3.0
+transformers>=4.45,<5.0
+scipy>=1.11,<2.0
+
