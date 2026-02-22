@@ -355,5 +355,5 @@ MIT
 
 ## References
 
-- REAM Paper: "REAM: Compressing Mixture-of-Experts LLMs"
+- Blog post: [Understanding MoE Compression](https://bknyaz.github.io/blog/2026/moe/) - Detailed explanation of the REAM/REAP algorithm and theory
 - Based on insights from [Cerebras Research/reap](https://github.com/CerebrasResearch/reap)
