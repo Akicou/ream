@@ -3,6 +3,9 @@
 > REAM/REAP-style Mixture-of-Experts compression framework with production-ready support for multiple model families.
 
 **REAM-MoE** is a Python library for compressing Mixture-of-Experts (MoE) Large Language Models using the REAM (REAM-style expert merging) algorithm. It provides a generic, model-agnostic compression framework with adapter-based architecture for supporting multiple MoE model families.
+
+> **Note:** Model configurations may not be 100% correct for all model families. If you encounter issues with a specific model, please verify the configuration and consider opening an issue or contributing a fix.
+
 ## Releases
  - [Akicou/Qwen3-30B-A3B-Instruct-REAMINI](https://huggingface.co/Akicou/Qwen3-30B-A3B-Instruct-REAMINI)
 ## Features
@@ -46,6 +49,8 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+For an interactive tutorial, see the [Quickstart Notebook](examples/quickstart.ipynb).
+
 ### Using the CLI
 
 The easiest way to compress a model is using the provided CLI script:
@@ -64,6 +69,7 @@ python examples/compress_model.py \
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from ream_moe import observe_model, prune_model, PruningConfig
+from ream_moe.calibration import build_calibration_batches
 
 # Load model
 model = AutoModelForCausalLM.from_pretrained(
@@ -74,11 +80,21 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B-MoE", trust_remote_code=True)
 
+# Prepare calibration data
+# Use built-in datasets: "c4", "code", "math", "writing", "hardcoded", "combined"
+batches = list(build_calibration_batches(
+    tokenizer,
+    "hardcoded",  # Recommended: diverse hardcoded prompts
+    max_seq_len=512,
+    batch_size=4,
+    samples=1000,
+))
+
 # Collect activation statistics on calibration data
 observer_data = observe_model(
     model,
-    calibration_input_ids,
-    calibration_attention_mask,
+    batches[0].input_ids,
+    batches[0].attention_mask,
 )
 
 # Prune 25% of experts
@@ -93,9 +109,8 @@ tokenizer.save_pretrained("./compressed_model")
 ### Using Expert Merging
 
 ```python
-from ream_moe import observe_model, merge_model, MergeConfig
-
-# ... load model and collect observer_data ...
+from ream_moe import merge_model, MergeConfig
+# First, load model and collect observer_data as shown above
 
 # Merge experts to keep 75% (25% compression)
 config = MergeConfig(target_ratio=0.75)
