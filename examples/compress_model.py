@@ -171,6 +171,11 @@ Examples:
         action="store_true",
         help="Renormalize router weights after top-k",
     )
+    parser.add_argument(
+        "--poor",
+        action="store_true",
+        help="Store observer statistics on CPU/RAM instead of GPU to avoid OOM (slower but uses less GPU memory)",
+    )
 
     # Verification
     parser.add_argument(
@@ -242,10 +247,14 @@ def collect_observer_data(model, tokenizer, args):
     """Collect activation statistics using the observer."""
     logger.info("Collecting activation statistics...")
 
+    if args.poor:
+        logger.info("Using CPU/RAM for observer statistics to save GPU memory")
+
     observer_config = ObserverConfig(
         max_tokens_per_layer=args.max_tokens,
         renormalize_router_weights=args.renormalize_router,
         device=args.device,
+        store_on_cpu=args.poor,
     )
 
     observer = MoEObserver(model, observer_config)

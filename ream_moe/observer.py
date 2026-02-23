@@ -46,22 +46,26 @@ class LayerObserverState:
     expert_frequency: Optional[torch.Tensor] = None
     saliency_scores: Optional[torch.Tensor] = None
 
-    def finalize(self, device: torch.device) -> None:
+    def finalize(self, device: torch.device, store_on_cpu: bool = False) -> None:
         """
         Convert collected lists to tensors and compute final statistics.
 
         Args:
-            device: Device to store tensors on
+            device: Device for forward pass
+            store_on_cpu: If True, keep tensors on CPU to save GPU memory
         """
+        # Determine storage device (CPU if requested to save GPU memory)
+        storage_device = torch.device('cpu') if store_on_cpu else device
+
         if self.router_logits:
-            self.router_logits = torch.cat(self.router_logits, dim=0).to(device)
+            self.router_logits = torch.cat(self.router_logits, dim=0).to(storage_device)
 
         if self.expert_outputs:
             # Concatenate along token dimension
             # expert_outputs is a list of tensors, each with shape [num_experts, num_tokens, hidden_dim]
-            self.expert_outputs = torch.cat(self.expert_outputs, dim=1).to(device)
+            self.expert_outputs = torch.cat(self.expert_outputs, dim=1).to(storage_device)
 
-        # Compute final statistics
+        # Compute final statistics (keep on storage device)
         if self.router_logits is not None:
             num_experts = self.router_logits.shape[-1]
             probs = torch.softmax(self.router_logits, dim=-1)
@@ -74,7 +78,7 @@ class LayerObserverState:
             flat_idx = topk_idx.view(-1)
             self.expert_frequency = torch.bincount(
                 flat_idx, minlength=num_experts
-            ).to(device)
+            ).to(storage_device)
 
 
 @dataclass
@@ -83,7 +87,8 @@ class ObserverConfig:
 
     max_tokens_per_layer: int = 2048 * 512  # Maximum tokens to collect per layer
     renormalize_router_weights: bool = False  # Renormalize router after top-k
-    device: str = "cuda"  # Device to store collected data
+    device: str = "cuda"  # Device for forward pass
+    store_on_cpu: bool = False  # Store collected statistics on CPU to save GPU memory
 
 
 class MoEObserver:
@@ -361,7 +366,7 @@ class MoEObserver:
 
         for layer_idx, state in self.layer_states.items():
             if state.expert_frequency is None:
-                state.finalize(device)
+                state.finalize(device, store_on_cpu=self.config.store_on_cpu)
 
             # Compute saliency scores
             if (
