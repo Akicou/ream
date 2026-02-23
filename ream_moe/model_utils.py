@@ -515,12 +515,28 @@ def _verify_model_structure(
 
         if hasattr(current, parts[-1]):
             experts = getattr(current, parts[-1])
-            # Try to get length - handle both hasattr(__len__) and direct len() call
-            try:
-                num_experts = len(experts)
-                logger.info(f"✅ Found {num_experts} experts")
-            except TypeError:
-                errors.append(f"Experts at '{experts_path}' is not a list/array")
+
+            # Handle fused experts (Qwen3, Llama4, etc.)
+            if model_attrs.get("fused", False):
+                # For fused experts, check for gate_up_proj tensor
+                if hasattr(experts, "gate_up_proj"):
+                    num_experts = experts.gate_up_proj.shape[0]
+                    logger.info(f"✅ Found {num_experts} fused experts (via gate_up_proj)")
+                elif hasattr(experts, "__len__"):
+                    try:
+                        num_experts = len(experts)
+                        logger.info(f"✅ Found {num_experts} experts")
+                    except TypeError:
+                        errors.append(f"Fused experts at '{experts_path}' has no gate_up_proj and is not subscriptable")
+                else:
+                    errors.append(f"Fused experts at '{experts_path}' has no gate_up_proj attribute")
+            else:
+                # Regular (non-fused) experts - should be ModuleList
+                try:
+                    num_experts = len(experts)
+                    logger.info(f"✅ Found {num_experts} experts")
+                except TypeError:
+                    errors.append(f"Experts at '{experts_path}' is not a list/array")
         else:
             errors.append(f"MoE block missing 'experts' attribute at '{experts_path}'")
 
