@@ -500,6 +500,10 @@ def _update_router_for_merge(
         if hasattr(inner, "e_score_correction_bias"):
             inner.e_score_correction_bias.data = inner.e_score_correction_bias.data[idx_tensor]
 
+        # Update top_k if needed (can't select more experts than available)
+        if hasattr(inner, "top_k"):
+            inner.top_k = min(inner.top_k, len(centroid_indices))
+
         # Update out_features
         if hasattr(inner, "out_features"):
             inner.out_features = len(centroid_indices)
@@ -515,6 +519,10 @@ def _update_router_for_merge(
         # Handle e_score_correction_bias (DeepSeek V3 / MoEGate)
         if hasattr(router, "e_score_correction_bias"):
             router.e_score_correction_bias.data = router.e_score_correction_bias.data[idx_tensor]
+
+        # Update top_k if needed (can't select more experts than available)
+        if hasattr(router, "top_k"):
+            router.top_k = min(router.top_k, len(centroid_indices))
 
         router.out_features = len(centroid_indices)
 
@@ -563,17 +571,31 @@ def merge_model(
         model_class = model.__class__.__name__
         if model_class == "KimiVLForConditionalGeneration":
             if hasattr(model.config, "text_config"):
+                # Update n_routed_experts
                 for attr_name in ["n_routed_experts", "num_experts", "num_local_experts", "moe_num_experts"]:
                     if hasattr(model.config.text_config, attr_name):
                         logger.info(f"Updating model.config.text_config.{attr_name} = {final_expert_count}")
                         setattr(model.config.text_config, attr_name, final_expert_count)
                         break
+                # Update num_experts_per_tok if needed (can't select more than available)
+                if hasattr(model.config.text_config, "num_experts_per_tok"):
+                    old_topk = model.config.text_config.num_experts_per_tok
+                    if old_topk > final_expert_count:
+                        logger.info(f"Updating model.config.text_config.num_experts_per_tok = {final_expert_count} (was {old_topk})")
+                        setattr(model.config.text_config, "num_experts_per_tok", final_expert_count)
 
         # Try to update various possible config attributes
         for attr_name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
             if hasattr(model.config, attr_name):
                 logger.info(f"Updating model.config.{attr_name} = {final_expert_count}")
                 setattr(model.config, attr_name, final_expert_count)
+
+        # Update num_experts_per_tok for non-nested configs
+        if not hasattr(model.config, "text_config") and hasattr(model.config, "num_experts_per_tok"):
+            old_topk = model.config.num_experts_per_tok
+            if old_topk > final_expert_count:
+                logger.info(f"Updating model.config.num_experts_per_tok = {final_expert_count} (was {old_topk})")
+                setattr(model.config, "num_experts_per_tok", final_expert_count)
 
     # Log summary
     if retained_counts:
