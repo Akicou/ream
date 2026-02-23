@@ -114,8 +114,8 @@ for layer_idx in range(min(5, len(layers))):
         continue
 
     # List all attributes of MoE block
-    print(f"\nMoE block attributes:")
-    for attr in dir(moe_block):
+    print(f"\nMoE block attributes (all non-callable, non-private):")
+    for attr in sorted(dir(moe_block)):
         if not attr.startswith("_"):
             try:
                 val = getattr(moe_block, attr)
@@ -125,6 +125,8 @@ for layer_idx in range(min(5, len(layers))):
                         print(f"  {attr}: {type_name} {tuple(val.shape)}")
                     elif hasattr(val, "__len__"):
                         print(f"  {attr}: {type_name} len={len(val)}")
+                    elif isinstance(val, torch.nn.Module):
+                        print(f"  {attr}: {type_name} (Module)")
                     else:
                         print(f"  {attr}: {type_name}")
             except Exception as e:
@@ -138,8 +140,8 @@ for layer_idx in range(min(5, len(layers))):
         print(f"{'=' * 70}")
 
         # List all attributes of experts
-        print(f"\nExperts attributes:")
-        for attr in dir(experts):
+        print(f"\nExperts attributes (all non-callable, non-private):")
+        for attr in sorted(dir(experts)):
             if not attr.startswith("_"):
                 try:
                     val = getattr(experts, attr)
@@ -148,10 +150,12 @@ for layer_idx in range(min(5, len(layers))):
                             print(f"  {attr}: Tensor {tuple(val.shape)}")
                         elif hasattr(val, "__len__"):
                             print(f"  {attr}: {type(val).__name__} len={len(val)}")
+                        elif isinstance(val, torch.nn.Module):
+                            print(f"  {attr}: {type(val).__name__} (Module)")
                         else:
                             print(f"  {attr}: {type(val).__name__}")
                 except Exception as e:
-                    pass  # Skip errors
+                    print(f"  {attr}: <error: {e}>")
 
         # Check specific tensor attributes
         print(f"\nExpert tensor details:")
@@ -202,10 +206,26 @@ for layer_idx in range(min(5, len(layers))):
         print(f"  gate: {gate.__class__.__name__}")
         if hasattr(gate, "weight"):
             print(f"    weight shape: {tuple(gate.weight.shape)}")
+    else:
+        print(f"  No 'gate' attribute found")
 
     if hasattr(moe_block, "router"):
         router = moe_block.router
         print(f"  router: {router.__class__.__name__}")
+    else:
+        print(f"  No 'router' attribute found")
+
+    # Check for other common router names
+    for router_name in ["gate", "router", "wg"]:
+        if hasattr(moe_block, router_name):
+            obj = getattr(moe_block, router_name)
+            print(f"  Found {router_name}: {obj.__class__.__name__}")
+            if hasattr(obj, "weight"):
+                print(f"    weight: {tuple(obj.weight.shape)}")
+            if hasattr(obj, "bias"):
+                print(f"    bias: {tuple(obj.bias.shape)}")
+            # List its attributes
+            print(f"    Attributes: {[a for a in dir(obj) if not a.startswith('_') and not callable(getattr(obj, a))]}")
 
     # Only check first MoE layer
     break
