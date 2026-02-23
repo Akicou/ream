@@ -234,10 +234,28 @@ def _group_experts_around_centroids(
 
         groups.append(group)
 
-    # Remaining unused experts become singletons
+    # Force remaining unused experts into groups to meet exact target count
     remaining = torch.where(~used)[0]
-    for r in remaining:
-        groups.append([int(r.item())])
+    if len(remaining) > 0:
+        # Distribute remaining experts to the most similar groups
+        for r in remaining:
+            r_idx = int(r.item())
+            # Find the most similar group (by centroid)
+            best_group_idx = 0
+            best_sim = float('-inf')
+            for i, group in enumerate(groups):
+                c_idx = group[0]
+                # Compute similarity using router logits
+                sim = cosine_sim(
+                    expert_repr_router[r_idx].unsqueeze(-1),
+                    expert_repr_router[c_idx].unsqueeze(-1),
+                )
+                if sim > best_sim:
+                    best_sim = sim
+                    best_group_idx = i
+            # Add to best group (even if similarity is low)
+            groups[best_group_idx].append(r_idx)
+            used[r_idx] = True
 
     return groups
 
