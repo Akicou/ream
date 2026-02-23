@@ -15,6 +15,7 @@ most of the original model's capability.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -428,7 +429,7 @@ def _update_merged_weights(
         up_size = up_shape[0] * up_shape[1]
         down_size = down_shape[0] * down_shape[1]
 
-        # Create new ModuleList
+        # Create new ModuleList - reuse existing experts and update weights
         new_experts = nn.ModuleList()
 
         for group_idx in range(num_retained):
@@ -439,16 +440,14 @@ def _update_merged_weights(
             up_flat = flat[gate_size : gate_size + up_size]
             down_flat = flat[gate_size + up_size : gate_size + up_size + down_size]
 
-            # Create new expert
-            expert = experts[groups[0][0]].__class__(
-                gate=nn.Linear(gate_shape[1], gate_shape[0], bias=False),
-                up=nn.Linear(up_shape[1], up_shape[0], bias=False),
-                down=nn.Linear(down_shape[1], down_shape[0], bias=False),
-            )
+            # Clone the first expert from this group to preserve structure
+            expert_idx = groups[0][0] if groups and group_idx < len(groups) else group_idx
+            expert = deepcopy(experts[expert_idx])
 
-            expert.gate.weight.data = gate_flat.view(*gate_shape)
-            expert.up.weight.data = up_flat.view(*up_shape)
-            expert.down.weight.data = down_flat.view(*down_shape)
+            # Update weights directly without creating new instances
+            getattr(expert, gate_proj).weight.data = gate_flat.view(*gate_shape)
+            getattr(expert, up_proj).weight.data = up_flat.view(*up_shape)
+            getattr(expert, down_proj).weight.data = down_flat.view(*down_shape)
 
             new_experts.append(expert)
 
