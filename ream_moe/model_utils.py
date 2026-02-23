@@ -503,28 +503,48 @@ def _verify_model_structure(
     if layers is None or len(layers) == 0:
         return ["Could not find any decoder layers in the model"]
 
-    # Check first layer
-    layer = layers[0]
+    # Find first actual MoE layer (some models have first k layers as dense)
     moe_block_path = model_attrs.get("moe_block")
     if not moe_block_path:
         return ["MODEL_ATTRS missing 'moe_block' path"]
 
-    # Navigate to MoE block
     moe_block = None
-    current = layer
-    for attr in moe_block_path.split("."):
-        if hasattr(current, attr):
-            moe_block = getattr(current, attr)
-            current = moe_block
-        else:
-            errors.append(f"Layer 0 missing attribute '{moe_block_path}' (failed at '{attr}')")
-            return errors
+    moe_layer_idx = None
+
+    for layer_idx in range(min(10, len(layers))):  # Check first 10 layers
+        layer = layers[layer_idx]
+
+        # Navigate to MoE block
+        current = layer
+        found = True
+        for attr in moe_block_path.split("."):
+            if hasattr(current, attr):
+                current = getattr(current, attr)
+            else:
+                found = False
+                break
+
+        if found and current is not None:
+            # Check if this is actually an MoE block (has experts)
+            experts_path = model_attrs.get("experts", "experts")
+            parts = experts_path.split(".")
+            temp = current
+            for part in parts:
+                if hasattr(temp, part):
+                    temp = getattr(temp, part)
+                else:
+                    found = False
+                    break
+
+            if found and temp is not None:
+                moe_block = current
+                moe_layer_idx = layer_idx
+                logger.info(f"✅ Found MoE block in layer {layer_idx}: {moe_block.__class__.__name__}")
+                break
 
     if moe_block is None:
-        errors.append(f"Could not find MoE block at path '{moe_block_path}' in layer 0")
+        errors.append(f"Could not find MoE block with 'experts' in first 10 layers")
         return errors
-
-    logger.info(f"✅ Found MoE block: {moe_block.__class__.__name__}")
 
     # Check experts
     experts_path = model_attrs.get("experts")
