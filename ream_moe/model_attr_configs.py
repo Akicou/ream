@@ -120,6 +120,19 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts_per_tok": "num_experts_per_tok",
     },
 
+    # Kimi-VL - Vision-language model with DeepSeek V3-based language model
+    "KimiVLForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+
     # Ernie 4.5 MoE (Baidu)
     "Ernie4_5_MoEForCausalLM": {
         "moe_block": "mlp",

@@ -114,6 +114,17 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
         },
     ),
 
+    # Kimi-VL - Vision-language model with DeepSeek V3-based language model
+    "KimiVLForConditionalGeneration": type(
+        "KimiVLMoEObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "DeepseekV3MoE",
+            "num_experts_attr_name": "n_routed_experts",
+            "top_k_attr_name": "num_experts_per_tok",
+        },
+    ),
+
     # Ernie 4.5 MoE
     "Ernie4_5_MoEForCausalLM": type(
         "Ernie4_5MoEObserverConfig",
