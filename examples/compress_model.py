@@ -181,6 +181,11 @@ Examples:
         action="store_true",
         help="Process merge weight operations on CPU/RAM instead of GPU to avoid OOM during merging (slower but uses less GPU memory)",
     )
+    parser.add_argument(
+        "--use-sdpa",
+        action="store_true",
+        help="Use scaled_dot_product_attention for memory-efficient attention computation during calibration",
+    )
 
     # Verification
     parser.add_argument(
@@ -255,6 +260,9 @@ def collect_observer_data(model, tokenizer, args):
     if args.poor:
         logger.info("Using CPU/RAM for observer statistics to save GPU memory")
 
+    if args.use_sdpa:
+        logger.info("Using SDPA (scaled_dot_product_attention) for memory efficiency")
+
     observer_config = ObserverConfig(
         max_tokens_per_layer=args.max_tokens,
         renormalize_router_weights=args.renormalize_router,
@@ -264,6 +272,19 @@ def collect_observer_data(model, tokenizer, args):
 
     observer = MoEObserver(model, observer_config)
     observer.hook_model()
+
+    # Enable SDPA if requested
+    original_use_sdpa = None
+    original_attn_impl = None
+
+    if args.use_sdpa and hasattr(model.config, "use_sdpa"):
+        original_use_sdpa = model.config.use_sdpa
+        model.config.use_sdpa = True
+        logger.info("Enabled SDPA in model config")
+    elif args.use_sdpa and hasattr(model.config, "attn_implementation"):
+        original_attn_impl = model.config.attn_implementation
+        model.config.attn_implementation = "sdpa"
+        logger.info(f"Set attn_implementation to 'sdpa' (was: '{original_attn_impl}')")
 
     try:
         # Build calibration batches
@@ -290,11 +311,17 @@ def collect_observer_data(model, tokenizer, args):
                 input_ids = batch.input_ids.to(args.device)
                 attention_mask = batch.attention_mask.to(args.device)
 
-                # Forward pass
-                _ = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
+                # Forward pass with SDPA if enabled
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+
+                # Add use_cache=False for memory efficiency with SDPA
+                if args.use_sdpa:
+                    forward_kwargs["use_cache"] = False
+
+                _ = model(**forward_kwargs)
 
                 total_batches += 1
 
@@ -303,6 +330,12 @@ def collect_observer_data(model, tokenizer, args):
 
     finally:
         observer.unhook_model()
+
+        # Restore original SDPA setting
+        if args.use_sdpa and hasattr(model.config, "use_sdpa") and original_use_sdpa is not None:
+            model.config.use_sdpa = original_use_sdpa
+        elif args.use_sdpa and hasattr(model.config, "attn_implementation") and 'original_attn_impl' in locals():
+            model.config.attn_implementation = original_attn_impl
 
     # Get collected statistics
     observer_data = observer.get_collected_stats()
