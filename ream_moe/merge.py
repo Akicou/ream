@@ -303,7 +303,7 @@ def _merge_groups(
                 cost = torch.cdist(ref.float(), candidate.float())  # [neurons, neurons]
             else:
                 cost = torch.cdist(ref, candidate)  # [neurons, neurons]
-            row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
+            row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
             perm = torch.as_tensor(col_ind, device=device, dtype=torch.long)
 
             # Apply permutation and add weighted sum
