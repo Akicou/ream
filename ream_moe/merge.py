@@ -298,7 +298,11 @@ def _merge_groups(
             candidate = group_flat[g_idx]  # [neurons, rest]
 
             # Hungarian algorithm for optimal permutation
-            cost = torch.cdist(ref, candidate)  # [neurons, neurons]
+            # Convert to float32 for cdist if on CPU (BFloat16 not supported on CPU)
+            if device == "cpu" and (ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16):
+                cost = torch.cdist(ref.float(), candidate.float())  # [neurons, neurons]
+            else:
+                cost = torch.cdist(ref, candidate)  # [neurons, neurons]
             row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
             perm = torch.as_tensor(col_ind, device=device, dtype=torch.long)
 
