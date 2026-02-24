@@ -299,7 +299,7 @@ def _merge_groups(
 
             # Hungarian algorithm for optimal permutation
             # Convert to float32 for cdist if on CPU (BFloat16 not supported on CPU)
-            if device == "cpu" and (ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16):
+            if (not device.type.startswith('cuda')) and (ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16):
                 cost = torch.cdist(ref.float(), candidate.float())  # [neurons, neurons]
             else:
                 cost = torch.cdist(ref, candidate)  # [neurons, neurons]
