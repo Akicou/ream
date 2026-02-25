@@ -557,12 +557,41 @@ def _verify_model_structure(
                 else:
                     errors.append(f"Fused experts at '{experts_path}' has no gate_up_proj attribute")
             else:
-                # Regular (non-fused) experts - should be ModuleList
+                # Regular (non-fused) experts - should be ModuleList or similar
                 try:
                     num_experts = len(experts)
                     logger.info(f"✅ Found {num_experts} experts")
                 except TypeError:
-                    errors.append(f"Experts at '{experts_path}' is not a list/array")
+                    # experts might be a different container type
+                    # Try to determine if it's a valid experts container
+                    experts_type = type(experts).__name__
+                    logger.info(f"🔍 Experts type: {experts_type}")
+                    logger.info(f"🔍 Experts attributes: {dir(experts)[:20]}")  # First 20 attributes
+
+                    # Check for various container types
+                    if isinstance(experts, nn.ModuleList):
+                        num_experts = len(experts)
+                        logger.info(f"✅ Found {num_experts} experts (ModuleList)")
+                    elif isinstance(experts, nn.ParameterDict):
+                        num_experts = len(experts)
+                        logger.info(f"✅ Found {num_experts} experts (ParameterDict)")
+                    elif isinstance(experts, dict):
+                        num_experts = len(experts)
+                        logger.info(f"✅ Found {num_experts} experts (dict)")
+                    elif hasattr(experts, '__len__'):
+                        try:
+                            num_experts = len(experts)
+                            logger.info(f"✅ Found {num_experts} experts (has __len__)")
+                        except Exception as e:
+                            logger.warning(f"Experts has __len__ but failed: {e}")
+                            errors.append(f"Experts at '{experts_path}' is type {experts_type} but len() failed: {e}")
+                    else:
+                        # Check if it might be a fused tensor or other representation
+                        if hasattr(experts, 'shape') and len(experts.shape) > 0:
+                            logger.info(f"⚠️  Experts appears to be a tensor with shape {experts.shape}")
+                            errors.append(f"Experts at '{experts_path}' is a tensor - check if 'fused' should be True")
+                        else:
+                            errors.append(f"Experts at '{experts_path}' is not a recognized container type (found {experts_type})")
         else:
             errors.append(f"MoE block missing 'experts' attribute at '{experts_path}'")
 

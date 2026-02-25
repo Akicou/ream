@@ -250,6 +250,18 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "moe_topk",
     },
+    "LongcatFlashNgramForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "router",
+        "router_weight_attr": "classifier.weight",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "moe_topk",
+    },
 
     # MiniMax M2.5 - Uses w1/w2/w3 projections
     "MiniMaxM2ForCausalLM": {

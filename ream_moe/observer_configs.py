@@ -220,6 +220,16 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
             "top_k_attr_name": "router.top_k",
         },
     ),
+    "LongcatFlashNgramForCausalLM": type(
+        "LongcatFlashNgramObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "LongcatMoE",
+            "num_experts_attr_name": "config.n_routed_experts",
+            "top_k_attr_name": "router.top_k",
+            "fused_experts": True,
+        },
+    ),
 
     # MiniMax M2.5
     "MiniMaxM2ForCausalLM": type(
