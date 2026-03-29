@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functools import reduce
 from tqdm import tqdm
 
 from ream_moe.model_attr_configs import MODEL_ATTRS, get_model_attrs
@@ -46,13 +47,15 @@ class LayerObserverState:
     expert_frequency: Optional[torch.Tensor] = None
     saliency_scores: Optional[torch.Tensor] = None
 
-    def finalize(self, device: torch.device, store_on_cpu: bool = False) -> None:
+    def finalize(self, device: torch.device, store_on_cpu: bool = False, top_k: Optional[int] = None) -> None:
         """
         Convert collected lists to tensors and compute final statistics.
 
         Args:
             device: Device for forward pass
             store_on_cpu: If True, keep tensors on CPU to save GPU memory
+            top_k: Actual number of experts activated per token (from model config).
+                   If None, falls back to using all experts (inaccurate for frequency).
         """
         # Determine storage device (CPU if requested to save GPU memory)
         storage_device = torch.device('cpu') if store_on_cpu else device
@@ -70,9 +73,10 @@ class LayerObserverState:
             num_experts = self.router_logits.shape[-1]
             probs = torch.softmax(self.router_logits, dim=-1)
 
-            # Get top-k selections
-            top_k = probs.shape[-1]  # Default to all if not specified
-            _, topk_idx = torch.topk(probs, k=min(top_k, num_experts), dim=-1)
+            # Use the actual model top_k so frequency counts only routed tokens
+            actual_top_k = top_k if top_k is not None else num_experts
+            actual_top_k = min(actual_top_k, num_experts)
+            _, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
             # Count expert activations
             flat_idx = topk_idx.view(-1)
@@ -119,6 +123,7 @@ class MoEObserver:
         self.config = config or ObserverConfig()
         self.hooks: List[Callable] = []
         self.layer_states: Dict[int, LayerObserverState] = {}
+        self.layer_top_k: Dict[int, int] = {}  # actual top-k per layer from model config
 
         # Ensure model is registered
         ensure_model_registered(model)
@@ -142,6 +147,13 @@ class MoEObserver:
         for layer_idx in self.moe_layer_indices:
             moe_block = get_moe_block(self.model, layer_idx)
             self.layer_states[layer_idx] = LayerObserverState()
+
+            # Store actual top-k for this layer so saliency only counts routed tokens
+            try:
+                from ream_moe.model_utils import get_top_k
+                self.layer_top_k[layer_idx] = get_top_k(self.model, layer_idx)
+            except Exception:
+                self.layer_top_k[layer_idx] = 1  # safe conservative fallback
 
             # Create hook function for this layer
             def make_hook(idx: int):
@@ -365,8 +377,9 @@ class MoEObserver:
         device = torch.device(self.config.device)
 
         for layer_idx, state in self.layer_states.items():
+            top_k = self.layer_top_k.get(layer_idx)
             if state.expert_frequency is None:
-                state.finalize(device, store_on_cpu=self.config.store_on_cpu)
+                state.finalize(device, store_on_cpu=self.config.store_on_cpu, top_k=top_k)
 
             # Compute saliency scores
             if (
@@ -375,7 +388,7 @@ class MoEObserver:
                 and state.saliency_scores is None
             ):
                 state.saliency_scores = self._compute_saliency(
-                    state.router_logits, state.expert_outputs
+                    state.router_logits, state.expert_outputs, top_k=top_k
                 )
 
         # Convert to output format
@@ -394,6 +407,7 @@ class MoEObserver:
     def _compute_saliency(
         router_logits: torch.Tensor,  # [num_tokens, num_experts]
         expert_outputs: torch.Tensor,  # [num_experts, num_tokens, hidden_dim]
+        top_k: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute REAP saliency scores per expert.
@@ -403,6 +417,9 @@ class MoEObserver:
         Args:
             router_logits: Router logits for all tokens
             expert_outputs: Expert output hidden states
+            top_k: Actual number of experts activated per token (from model config).
+                   Critical for correctness: only tokens where expert i was in the
+                   top-k routing selection should contribute to its saliency score.
 
         Returns:
             Saliency scores [num_experts]
@@ -410,9 +427,10 @@ class MoEObserver:
         num_tokens, num_experts = router_logits.shape
         probs = torch.softmax(router_logits, dim=-1)  # [num_tokens, num_experts]
 
-        # Get top-k
-        top_k = min(num_experts, router_logits.shape[-1])
-        topk_vals, topk_idx = torch.topk(probs, k=top_k, dim=-1)
+        # Use the model's actual top-k so only routed tokens count toward saliency
+        actual_top_k = top_k if top_k is not None else num_experts
+        actual_top_k = min(actual_top_k, num_experts)
+        topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
         saliency = torch.zeros(num_experts, device=router_logits.device)
 

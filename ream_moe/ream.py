@@ -167,8 +167,10 @@ class REAMCompressor:
         probs = torch.softmax(router_logits, dim=-1)  # [T, N]
         # gated outputs: [N, T, D]
         gated = probs.T.unsqueeze(-1) * expert_outputs
-        expert_repr_hidden = gated.mean(dim=1)            # [N, D]
-        expert_repr_router = router_logits.T.mean(dim=1)  # [N]
+        expert_repr_hidden = gated.mean(dim=1)  # [N, D]
+        # Keep full routing distribution [N, T] so similarity reflects which tokens
+        # each expert is activated for, not just a collapsed scalar.
+        expert_repr_router = router_logits.T     # [N, T]
 
         def cosine_sim(a: Tensor, b: Tensor, eps: float = 1e-8) -> Tensor:
             a_norm = a / (a.norm(dim=-1, keepdim=True) + eps)
@@ -196,9 +198,10 @@ class REAMCompressor:
                 expert_repr_hidden[c_idx].expand_as(expert_repr_hidden[unused_idx]),
             )
 
+            # Cosine similarity over the full routing distribution [T] per expert.
             sim_router = cosine_sim(
-                expert_repr_router[unused_idx].unsqueeze(-1),
-                expert_repr_router[c_idx].unsqueeze(0).unsqueeze(-1),
+                expert_repr_router[unused_idx],  # [n_unused, T]
+                expert_repr_router[c_idx],       # [T] — broadcasts to [n_unused, T]
             )
 
             if self.cfg.use_gated_similarity:

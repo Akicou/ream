@@ -24,7 +24,7 @@ from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 from ream_moe.model_attr_configs import get_model_attrs
-from ream_moe.model_utils import get_moe_block, get_num_experts
+from ream_moe.model_utils import get_moe_block, get_num_experts, get_top_k
 from ream_moe.observer import LayerObserverState
 
 logger = logging.getLogger(__name__)
@@ -75,9 +75,15 @@ def merge_layer(
     if router_logits is None or expert_outputs is None:
         raise ValueError(f"Layer {layer_idx}: Missing required observer data")
 
-    # Step 1: Compute saliency scores
+    # Step 1: Compute saliency scores using the model's actual top-k routing value
+    try:
+        layer_top_k = get_top_k(model, layer_idx)
+    except Exception:
+        layer_top_k = None  # will fall back to num_experts (less accurate)
+
     saliency = _compute_saliency_scores(
-        router_logits, expert_outputs, observer_stats, config.saliency_metric
+        router_logits, expert_outputs, observer_stats, config.saliency_metric,
+        top_k=layer_top_k,
     )  # [N]
 
     # Step 2: Select centroids
@@ -112,6 +118,7 @@ def _compute_saliency_scores(
     expert_outputs: torch.Tensor,
     observer_stats: Dict[str, torch.Tensor],
     metric: str,
+    top_k: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Compute saliency/importance scores for each expert.
@@ -121,23 +128,27 @@ def _compute_saliency_scores(
         expert_outputs: [num_experts, num_tokens, hidden_dim]
         observer_stats: Additional observer statistics
         metric: Which metric to use ("saliency_scores", "expert_frequency", etc.)
+        top_k: Model's actual routing top-k. Only tokens where expert i is in the
+               top-k contribute to its saliency score. If None, all tokens are used
+               (inaccurate — inflates saliency for rarely-routed experts).
 
     Returns:
         Saliency scores [num_experts]
     """
     num_experts = router_logits.shape[-1]
 
-    # Use pre-computed metric if available
+    # Use pre-computed metric if available (e.g. from observer's saliency_scores)
     if metric in observer_stats:
         precomputed = observer_stats[metric]
         if isinstance(precomputed, torch.Tensor) and precomputed.shape[0] == num_experts:
             return precomputed
 
-    # Compute REAP saliency
+    # Compute REAP saliency from scratch using the correct routing top-k
     T, N = router_logits.shape
     probs = torch.softmax(router_logits, dim=-1)
-    top_k = probs.shape[-1]
-    topk_vals, topk_idx = torch.topk(probs, k=top_k, dim=-1)
+    actual_top_k = top_k if top_k is not None else N
+    actual_top_k = min(actual_top_k, N)
+    topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
     saliency = torch.zeros(N, device=router_logits.device)
 
@@ -185,8 +196,10 @@ def _group_experts_around_centroids(
 
     # Compute expert representations
     gated = probs.T.unsqueeze(-1) * expert_outputs
-    expert_repr_hidden = gated.mean(dim=1)  # [N, D]
-    expert_repr_router = router_logits.T.mean(dim=1)  # [N]
+    expert_repr_hidden = gated.mean(dim=1)  # [N, D] — gate-weighted mean hidden state
+    # Keep full routing distribution [N, T] so cosine similarity captures routing pattern,
+    # not just a collapsed scalar (which was near-meaningless before).
+    expert_repr_router = router_logits.T  # [N, T]
 
     def cosine_sim(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         a_norm = a / (a.norm(dim=-1, keepdim=True) + eps)
@@ -215,9 +228,11 @@ def _group_experts_around_centroids(
             expert_repr_hidden[c_idx].expand_as(expert_repr_hidden[unused_idx]),
         )
 
+        # Cosine similarity over full routing distribution [T] — compares which tokens
+        # each expert is activated for, not just a single scalar mean value.
         sim_router = cosine_sim(
-            expert_repr_router[unused_idx].unsqueeze(-1),
-            expert_repr_router[c_idx].unsqueeze(0).unsqueeze(-1),
+            expert_repr_router[unused_idx],   # [n_unused, T]
+            expert_repr_router[c_idx],        # [T] — broadcasts to [n_unused, T]
         )
 
         if config.use_gated_similarity:
@@ -269,63 +284,58 @@ def _merge_groups(
     Returns:
         Merged expert weights tensor
     """
+    # all_weights: [E, I, 3H]  — intermediate axis (I) is the neuron/permutation axis
     all_weights = _get_expert_weights(moe_block, attrs, use_cpu=use_cpu_for_weights)
     device = all_weights.device
-    merged_weights: List[torch.Tensor] = []
+    merged_list: List[torch.Tensor] = []
 
     for group in groups:
         if len(group) == 1:
-            # Singleton: keep original
-            merged_weights.append(all_weights[group[0]].detach().clone())
+            # Singleton: keep original weights unchanged
+            merged_list.append(all_weights[group[0]].detach().clone())
             continue
 
-        # Merge group
-        group_tensor = all_weights[group]  # [G, ...]
         G = len(group)
+        group_tensor = all_weights[group]  # [G, I, 3H]
 
-        # Get normalized saliency weights
-        s_vals = saliency[torch.tensor(group, device=device)]
+        # Saliency-normalised weights for this group
+        s_vals = saliency.to(device)[torch.tensor(group, device=device)]
         s_norm = s_vals / (s_vals.sum() + 1e-8)
 
         if skip_permutation:
-            # Fast path: simple weighted average (no permutation alignment)
-            # Much faster but may lose some quality
-            merged = torch.sum(group_tensor * s_norm.view(-1, 1, 1), dim=0)
-            merged_weights.append(merged)
+            # Fast path: saliency-weighted average without neuron permutation.
+            # ~10-100× faster but skips alignment, so merged neurons may cancel.
+            merged = torch.sum(group_tensor * s_norm.view(-1, 1, 1), dim=0)  # [I, 3H]
         else:
-            # Slow path: permutation-aware averaging with Hungarian algorithm
-            # Reshape: [G, neurons, rest]
-            group_flat = group_tensor.view(G, group_tensor.shape[1], -1)
+            # Permutation-aware averaging with Hungarian algorithm.
+            # For each non-centroid expert, find the neuron permutation that best
+            # aligns it to the centroid, then accumulate the weighted average.
+            ref = group_tensor[0]                  # [I, 3H] — centroid as reference
+            weights_accum = s_norm[0] * ref.clone()
 
-            # Use first expert as reference for permutation
-            ref = group_flat[0]  # [neurons, rest]
-            weights_accum = torch.zeros_like(ref)
-
-            # Start with reference
-            weights_accum += s_norm[0] * ref
-
-            # Merge other experts with permutation alignment
             for g_idx in range(1, G):
-                candidate = group_flat[g_idx]  # [neurons, rest]
+                candidate = group_tensor[g_idx]    # [I, 3H]
 
-                # Hungarian algorithm for optimal permutation
-                # Convert to float32 for cdist if on CPU (BFloat16 not supported on CPU)
-                if (not device.type.startswith('cuda')) and (ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16):
-                    cost = torch.cdist(ref.float(), candidate.float())  # [neurons, neurons]
+                # Pairwise Euclidean distance between neuron vectors [I, 3H] → cost [I, I]
+                # BFloat16 is unsupported by torch.cdist on CPU; upcast to float32.
+                if not device.type.startswith("cuda") and (
+                    ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16
+                ):
+                    cost = torch.cdist(ref.float(), candidate.float())
                 else:
-                    cost = torch.cdist(ref, candidate)  # [neurons, neurons]
-                row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+                    cost = torch.cdist(ref, candidate)
+
+                _row, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
                 perm = torch.as_tensor(col_ind, device=device, dtype=torch.long)
 
-                # Apply permutation and add weighted sum
-                permuted = candidate[perm]
-                weights_accum += s_norm[g_idx] * permuted
+                permuted = candidate[perm]         # [I, 3H] — neurons reordered to match ref
+                weights_accum = weights_accum + s_norm[g_idx] * permuted
 
-            # Reshape back to original shape
-            merged = weights_accum.view_as(group_tensor[0])
-            merged_weights.append(merged)
+            merged = weights_accum  # [I, 3H]
 
-    return torch.stack(merged_weights, dim=0)
+        merged_list.append(merged)
+
+    return torch.stack(merged_list, dim=0)  # [num_groups, I, 3H]
 
 
 def _get_expert_weights(
@@ -334,176 +344,148 @@ def _get_expert_weights(
     use_cpu: bool = False,
 ) -> torch.Tensor:
     """
-    Get all expert weights stacked into a single tensor.
+    Get all expert weights shaped as ``[E, intermediate, 3 * hidden_dim]``.
 
-    For fused experts: returns [num_experts, 2*intermediate + hidden_dim]
-    For separate experts: returns concatenated projection weights
+    Dimension 1 is the intermediate/neuron axis used for Hungarian permutation
+    alignment.  The last dimension concatenates the three projections so that
+    each row represents one "neuron":
 
-    Args:
-        moe_block: The MoE block
-        attrs: Model attributes
-        use_cpu: If True, load weights on CPU to save GPU memory
+        [:, :, :H]    — gate projection   (gate_proj / w3)
+        [:, :, H:2H]  — up   projection   (up_proj   / w1)
+        [:, :, 2H:]   — down projection^T (down_proj^T / w2^T)
 
-    Returns:
-        Stacked expert weights [num_experts, ...]
+    Transposing the down projection puts its columns (intermediate neurons)
+    along the same axis as the rows of gate/up, enabling a single permutation
+    that consistently reorders neurons across all three matrices.
+
+    For fused experts (gate_up_proj tensor of shape [E, 2*I, H]):
+        gate portion = gate_up_proj[:, :I, :]   shape [E, I, H]
+        up   portion = gate_up_proj[:, I:, :]   shape [E, I, H]
+        down^T       = down_proj.permute(0,2,1) shape [E, I, H]
     """
     experts = moe_block.experts
 
-    # Helper to safely move tensor, handling meta tensors
-    def safe_to_tensor(tensor, target_device):
-        """Safely move tensor to device, handling meta tensors."""
-        if tensor.device.type == "meta":
-            # For meta tensors, accessing .to() will trigger materialization
-            # This is handled by accelerate's device_map
-            try:
-                return tensor.to(target_device)
-            except NotImplementedError:
-                # If direct .to() fails, the tensor is truly meta and not materialized
-                # This happens with some accelerate offload strategies
-                # We need to force materialization through the module
-                return tensor.data.to(target_device)
-        else:
-            return tensor.to(target_device) if str(tensor.device) != str(target_device) else tensor
-
-    # Determine target device
-    if attrs.get("fused", False):
-        current_device = experts.gate_up_proj.device
-        target_device = "cpu" if use_cpu else (current_device if current_device.type != "meta" else "cuda")
-    else:
-        current_device = experts[0].gate_proj.weight.device
-        target_device = "cpu" if use_cpu else (current_device if current_device.type != "meta" else "cuda")
-
-    device = target_device
+    def safe_cpu(t: torch.Tensor) -> torch.Tensor:
+        """Move tensor to CPU if requested, handling meta/offloaded tensors."""
+        if not use_cpu or t.device.type == "cpu":
+            return t
+        try:
+            return t.to("cpu")
+        except NotImplementedError:
+            return t.data.to("cpu")
 
     if attrs.get("fused", False):
-        # Fused: gate_up_proj and down_proj
-        gate_up = safe_to_tensor(experts.gate_up_proj, device)
-        down = safe_to_tensor(experts.down_proj, device)
+        gate_up = safe_cpu(experts.gate_up_proj)  # [E, 2I, H]
+        down    = safe_cpu(experts.down_proj)      # [E, H, I]
 
-        num_experts = gate_up.shape[0]
-        intermediate_size = down.shape[2]
-        hidden_dim = gate_up.shape[2]
+        _E, two_I, H = gate_up.shape
+        I = two_I // 2
 
-        # Stack as [gate, up, down] flattened
-        weights = []
-        for i in range(num_experts):
-            gate_up_flat = gate_up[i].view(-1)  # [2*I*H]
-            down_flat = down[i].view(-1)  # [H*I]
-            weights.append(torch.cat([gate_up_flat, down_flat]))
+        gate   = gate_up[:, :I, :]          # [E, I, H]
+        up     = gate_up[:, I:, :]          # [E, I, H]
+        down_t = down.permute(0, 2, 1)      # [E, I, H]
 
-        return torch.stack(weights, dim=0).unsqueeze(1)  # [E, 1, D]
+        return torch.cat([gate, up, down_t], dim=-1)  # [E, I, 3H]
     else:
-        # Separate: concatenate gate_proj, up_proj, down_proj weights
-        gate_proj = attrs.get("gate_proj", "gate_proj")
-        up_proj = attrs.get("up_proj", "up_proj")
-        down_proj = attrs.get("down_proj", "down_proj")
+        gate_attr = attrs.get("gate_proj", "gate_proj")
+        up_attr   = attrs.get("up_proj",   "up_proj")
+        down_attr = attrs.get("down_proj", "down_proj")
 
-        num_experts = len(experts)
-        weights = []
+        gates: List[torch.Tensor] = []
+        ups:   List[torch.Tensor] = []
+        downs: List[torch.Tensor] = []
 
-        for i in range(num_experts):
-            expert = experts[i]
-            gate = safe_to_tensor(getattr(expert, gate_proj).weight.flatten(), device)
-            up = safe_to_tensor(getattr(expert, up_proj).weight.flatten(), device)
-            down = safe_to_tensor(getattr(expert, down_proj).weight.flatten(), device)
-            weights.append(torch.cat([gate, up, down]))
+        for expert in experts:
+            gates.append(safe_cpu(getattr(expert, gate_attr).weight))    # [I, H]
+            ups.append(  safe_cpu(getattr(expert, up_attr).weight))      # [I, H]
+            downs.append(safe_cpu(getattr(expert, down_attr).weight.T))  # [I, H]
 
-        return torch.stack(weights, dim=0).unsqueeze(1)  # [E, 1, D]
+        gate_stack  = torch.stack(gates)   # [E, I, H]
+        up_stack    = torch.stack(ups)     # [E, I, H]
+        down_t_stack = torch.stack(downs)  # [E, I, H]
+
+        return torch.cat([gate_stack, up_stack, down_t_stack], dim=-1)  # [E, I, 3H]
 
 
 def _update_merged_weights(
     moe_block: nn.Module,
-    merged_weights: torch.Tensor,
+    merged_weights: torch.Tensor,  # [num_groups, I, 3H]
     groups: List[List[int]],
     attrs: Dict[str, Any],
 ) -> None:
     """
-    Write merged weights back to the model and update router.
+    Write merged expert weights back to the model and update the router.
 
-    Args:
-        moe_block: The MoE block to update
-        merged_weights: Merged expert weights [len(groups), ...]
-        groups: Expert groups (used to know original shapes)
-        attrs: Model attributes
+    ``merged_weights`` has shape ``[num_groups, I, 3H]`` produced by
+    ``_merge_groups``.  The last dimension is unpacked as::
+
+        [:, :, :H]    → gate projection
+        [:, :, H:2H]  → up   projection
+        [:, :, 2H:]   → down projection^T  (transpose back before writing)
+
+    For fused experts the three matrices are repacked into ``gate_up_proj``
+    and ``down_proj``.  For separate experts the centroid module of each group
+    is reused (weights updated in-place) to avoid model-specific constructor
+    arguments that differ across architectures (w1/w3, gate_proj, etc.).
     """
     experts = moe_block.experts
     num_retained = len(groups)
 
     if attrs.get("fused", False):
-        # Update fused experts
-        intermediate_size = experts.down_proj.shape[2]
-        hidden_dim = experts.gate_up_proj.shape[2]
+        # gate_up_proj: [E, 2I, H],  down_proj: [E, H, I]
+        H           = experts.gate_up_proj.shape[2]
+        target_dev  = experts.gate_up_proj.device
 
-        new_gate_up = []
-        new_down = []
+        new_gate_up: List[torch.Tensor] = []
+        new_down:    List[torch.Tensor] = []
 
         for group_idx in range(num_retained):
-            flat = merged_weights[group_idx].squeeze().view(-1)
+            m      = merged_weights[group_idx].to(target_dev)  # [I, 3H]
+            gate   = m[:, :H].contiguous()                     # [I, H]
+            up     = m[:, H:2 * H].contiguous()                # [I, H]
+            down_t = m[:, 2 * H:].contiguous()                 # [I, H]  (was down^T)
 
-            # Split back into gate_up and down
-            gate_up_size = 2 * intermediate_size * hidden_dim
-            gate_up_flat = flat[:gate_up_size]
-            down_flat = flat[gate_up_size:]
+            new_gate_up.append(torch.cat([gate, up], dim=0))   # [2I, H]
+            new_down.append(down_t.T.contiguous())              # [H, I]
 
-            gate_up = gate_up_flat.view(2 * intermediate_size, hidden_dim)
-            down = down_flat.view(hidden_dim, intermediate_size)
-
-            new_gate_up.append(gate_up)
-            new_down.append(down)
-
-        # Create new tensors
-        experts.gate_up_proj.data = torch.stack(new_gate_up, dim=0)
-        experts.down_proj.data = torch.stack(new_down, dim=0)
+        experts.gate_up_proj.data = torch.stack(new_gate_up)   # [num_retained, 2I, H]
+        experts.down_proj.data    = torch.stack(new_down)       # [num_retained, H, I]
 
         if hasattr(experts, "num_experts"):
             experts.num_experts = num_retained
 
     else:
-        # Update separate experts
-        gate_proj = attrs.get("gate_proj", "gate_proj")
-        up_proj = attrs.get("up_proj", "up_proj")
-        down_proj = attrs.get("down_proj", "down_proj")
+        # Non-fused: reuse the centroid expert module from each group and update
+        # its weights in-place.  This avoids model-specific constructor arguments
+        # (gate_proj vs w3 vs wi_0, etc.) that differ across architectures.
+        gate_attr = attrs.get("gate_proj", "gate_proj")
+        up_attr   = attrs.get("up_proj",   "up_proj")
+        down_attr = attrs.get("down_proj", "down_proj")
 
-        # Get original shapes from first expert
-        first_expert = experts[groups[0][0]]
-        gate_shape = getattr(first_expert, gate_proj).weight.shape
-        up_shape = getattr(first_expert, up_proj).weight.shape
-        down_shape = getattr(first_expert, down_proj).weight.shape
-
-        # Compute sizes
-        gate_size = gate_shape[0] * gate_shape[1]
-        up_size = up_shape[0] * up_shape[1]
-        down_size = down_shape[0] * down_shape[1]
-
-        # Create new ModuleList
         new_experts = nn.ModuleList()
 
-        for group_idx in range(num_retained):
-            flat = merged_weights[group_idx].squeeze()
+        for group_idx, group in enumerate(groups):
+            m   = merged_weights[group_idx]  # [I, 3H]
+            H   = m.shape[1] // 3
 
-            # Split into projections
-            gate_flat = flat[:gate_size]
-            up_flat = flat[gate_size : gate_size + up_size]
-            down_flat = flat[gate_size + up_size : gate_size + up_size + down_size]
+            gate_w = m[:, :H].contiguous()          # [I, H]
+            up_w   = m[:, H:2 * H].contiguous()     # [I, H]
+            down_w = m[:, 2 * H:].T.contiguous()    # [H, I]  (transpose back)
 
-            # Create new expert
-            expert = experts[groups[0][0]].__class__(
-                gate=nn.Linear(gate_shape[1], gate_shape[0], bias=False),
-                up=nn.Linear(up_shape[1], up_shape[0], bias=False),
-                down=nn.Linear(down_shape[1], down_shape[0], bias=False),
-            )
+            # Centroid expert module from this group
+            centroid = experts[group[0]]
+            tgt = getattr(centroid, gate_attr).weight.device
 
-            expert.gate.weight.data = gate_flat.view(*gate_shape)
-            expert.up.weight.data = up_flat.view(*up_shape)
-            expert.down.weight.data = down_flat.view(*down_shape)
+            getattr(centroid, gate_attr).weight.data = gate_w.to(tgt)
+            getattr(centroid, up_attr  ).weight.data = up_w.to(tgt)
+            getattr(centroid, down_attr).weight.data = down_w.to(tgt)
 
-            new_experts.append(expert)
+            new_experts.append(centroid)
 
-        # Replace experts
         experts_attr = attrs.get("experts", "experts")
         setattr(moe_block, experts_attr, new_experts)
 
-    # Update router
+    # Shrink router to output only the centroid experts
     _update_router_for_merge(moe_block, groups, attrs)
 
 
@@ -592,10 +574,16 @@ def merge_model(
 
     # Update model config with new expert count
     if retained_counts:
-        # Get the expert count from first layer (all should be same after compression)
+        unique_counts = set(retained_counts.values())
         final_expert_count = list(retained_counts.values())[0]
 
-        # Try to update various possible config attributes
+        if len(unique_counts) > 1:
+            logger.warning(
+                f"Layers have different retained expert counts after merging: {unique_counts}. "
+                f"model.config will be updated to the first layer's count ({final_expert_count}), "
+                f"which may not reflect per-layer differences (e.g. NonUniform models)."
+            )
+
         for attr_name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
             if hasattr(model.config, attr_name):
                 logger.info(f"Updating model.config.{attr_name} = {final_expert_count}")
