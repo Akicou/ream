@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 MODEL_NAME = "moonshotai/Kimi-VL-A3B-Thinking-2506"
 
@@ -70,7 +70,7 @@ else:
     sys.exit(1)
 
 # Check language model structure
-print(f"\nLanguage model attributes:")
+print("\nLanguage model attributes:")
 for attr in dir(lang_model):
     if not attr.startswith("_") and not callable(getattr(lang_model, attr)):
         try:
@@ -84,10 +84,10 @@ for attr in dir(lang_model):
 # Get layers from language model
 if hasattr(lang_model, "model") and hasattr(lang_model.model, "layers"):
     layers = lang_model.model.layers
-    print(f"✓ Found layers at language_model.model.layers")
+    print("✓ Found layers at language_model.model.layers")
 elif hasattr(lang_model, "layers"):
     layers = lang_model.layers
-    print(f"✓ Found layers at language_model.layers")
+    print("✓ Found layers at language_model.layers")
 else:
     print("ERROR: Cannot find layers in language model")
     sys.exit(1)
@@ -112,14 +112,14 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
 
         # Check if mlp has nested 'experts' or 'gate'
         if hasattr(moe_block, "experts"):
-            print(f"  ✓ Has 'experts' attribute")
+            print("  ✓ Has 'experts' attribute")
         else:
-            print(f"  ✗ No 'experts' attribute")
+            print("  ✗ No 'experts' attribute")
 
         if hasattr(moe_block, "gate"):
-            print(f"  ✓ Has 'gate' attribute")
+            print("  ✓ Has 'gate' attribute")
         else:
-            print(f"  ✗ No 'gate' attribute")
+            print("  ✗ No 'gate' attribute")
     elif hasattr(layer, "block_sparse_moe"):
         moe_block = layer.block_sparse_moe
         print(f"✓ Found block_sparse_moe: {moe_block.__class__.__name__}")
@@ -128,7 +128,7 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
         continue
 
     # List all attributes of MoE block
-    print(f"\nMoE block attributes (all non-callable, non-private):")
+    print("\nMoE block attributes (all non-callable, non-private):")
     for attr in sorted(dir(moe_block)):
         if not attr.startswith("_"):
             try:
@@ -147,7 +147,7 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
                 print(f"  {attr}: <error accessing: {e}>")
 
     # List child modules (recursively find experts)
-    print(f"\nChild modules of MoE block:")
+    print("\nChild modules of MoE block:")
     for name, child in moe_block.named_children():
         print(f"  {name}: {child.__class__.__name__}")
         if isinstance(child, torch.nn.Linear):
@@ -163,7 +163,7 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
         print(f"{'=' * 70}")
 
         # List all attributes of experts
-        print(f"\nExperts attributes (all non-callable, non-private):")
+        print("\nExperts attributes (all non-callable, non-private):")
         for attr in sorted(dir(experts)):
             if not attr.startswith("_"):
                 try:
@@ -181,7 +181,7 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
                     print(f"  {attr}: <error: {e}>")
 
         # Check specific tensor attributes
-        print(f"\nExpert tensor details:")
+        print("\nExpert tensor details:")
         if hasattr(experts, "gate_proj"):
             gate = experts.gate_proj
             print(f"  gate_proj: {gate.__class__.__name__}")
@@ -195,12 +195,12 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
             print(f"  down_proj: {down.__class__.__name__}")
 
         # Check if experts is subscriptable
-        print(f"\nIs experts subscriptable?")
+        print("\nIs experts subscriptable?")
         try:
             test = experts[0]
             print(f"  ✓ experts[0] works: {type(test).__name__}")
             # Check individual expert structure
-            print(f"\nIndividual expert (experts[0]) attributes:")
+            print("\nIndividual expert (experts[0]) attributes:")
             for attr in dir(test):
                 if not attr.startswith("_") and not callable(getattr(test, attr)):
                     try:
@@ -221,7 +221,7 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
 
     # Check router/gate
     print(f"\n{'=' * 70}")
-    print(f"ROUTER/GATE:")
+    print("ROUTER/GATE:")
     print(f"{'=' * 70}")
 
     if hasattr(moe_block, "gate"):
@@ -230,13 +230,13 @@ for layer_idx in [0, 1, 5, 10, 15, 20]:
         if hasattr(gate, "weight"):
             print(f"    weight shape: {tuple(gate.weight.shape)}")
     else:
-        print(f"  No 'gate' attribute found")
+        print("  No 'gate' attribute found")
 
     if hasattr(moe_block, "router"):
         router = moe_block.router
         print(f"  router: {router.__class__.__name__}")
     else:
-        print(f"  No 'router' attribute found")
+        print("  No 'router' attribute found")
 
     # Check for other common router names
     for router_name in ["gate", "router", "wg"]:
@@ -261,7 +261,7 @@ if hasattr(model, "vision_tower"):
     print(f"✓ Found vision_tower: {vision_model.__class__.__name__}")
 
     # Check if vision model has MoE
-    print(f"\nVision model attributes:")
+    print("\nVision model attributes:")
     for attr in ["encoder", "blocks"]:
         if hasattr(vision_model, attr):
             val = getattr(vision_model, attr)
@@ -276,7 +276,7 @@ if hasattr(model, "multi_modal_projector"):
     projector = model.multi_modal_projector
     print(f"✓ Found multi_modal_projector: {projector.__class__.__name__}")
 
-    print(f"\nProjector attributes:")
+    print("\nProjector attributes:")
     for attr in dir(projector):
         if not attr.startswith("_") and not callable(getattr(projector, attr)):
             try:

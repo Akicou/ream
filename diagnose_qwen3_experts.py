@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 MODEL_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
@@ -64,7 +64,7 @@ for layer_idx in range(min(5, len(layers))):
         continue
 
     # List all attributes of MoE block
-    print(f"\nMoE block attributes:")
+    print("\nMoE block attributes:")
     for attr in dir(moe_block):
         if not attr.startswith("_"):
             try:
@@ -88,7 +88,7 @@ for layer_idx in range(min(5, len(layers))):
         print(f"{'=' * 70}")
 
         # List all attributes of experts
-        print(f"\nExperts attributes:")
+        print("\nExperts attributes:")
         for attr in dir(experts):
             if not attr.startswith("_"):
                 try:
@@ -100,11 +100,11 @@ for layer_idx in range(min(5, len(layers))):
                             print(f"  {attr}: {type(val).__name__} len={len(val)}")
                         else:
                             print(f"  {attr}: {type(val).__name__}")
-                except Exception as e:
+                except Exception:
                     pass  # Skip errors
 
         # Check specific tensor attributes
-        print(f"\nExpert tensor details:")
+        print("\nExpert tensor details:")
         if hasattr(experts, "gate_up_proj"):
             gate_up = experts.gate_up_proj
             print(f"  gate_up_proj: Tensor {tuple(gate_up.shape)}")
@@ -118,7 +118,7 @@ for layer_idx in range(min(5, len(layers))):
             print(f"    - device: {down.device}")
 
         # Check if experts is subscriptable
-        print(f"\nIs experts subscriptable?")
+        print("\nIs experts subscriptable?")
         try:
             test = experts[0]
             print(f"  ✓ experts[0] works: {type(test).__name__}")
@@ -134,7 +134,7 @@ for layer_idx in range(min(5, len(layers))):
 
     # Check router/gate
     print(f"\n{'=' * 70}")
-    print(f"ROUTER/GATE:")
+    print("ROUTER/GATE:")
     print(f"{'=' * 70}")
 
     if hasattr(moe_block, "gate"):

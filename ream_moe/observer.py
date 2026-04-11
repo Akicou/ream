@@ -14,6 +14,7 @@ to merge or prune.
 
 from __future__ import annotations
 
+from functools import reduce
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -21,10 +22,9 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 
-from ream_moe.model_attr_configs import MODEL_ATTRS, get_model_attrs
-from ream_moe.model_utils import get_moe_block, get_top_k, ensure_model_registered
+from ream_moe.model_attr_configs import get_model_attrs
+from ream_moe.model_utils import get_moe_block, ensure_model_registered
 
 logger = logging.getLogger(__name__)
 
@@ -314,11 +314,6 @@ class MoEObserver:
         gate_up_proj = experts.gate_up_proj  # [num_experts, 2*intermediate, hidden_dim]
         down_proj = experts.down_proj  # [num_experts, hidden_dim, intermediate]
 
-        num_tokens = flat_input.shape[0]
-        intermediate_size = down_proj.shape[2]
-        device = flat_input.device
-        dtype = flat_input.dtype
-
         outputs = []
 
         for expert_idx in range(num_experts):
@@ -447,7 +442,6 @@ def _get_num_experts_from_module(module: nn.Module, model_attrs: Dict[str, Any])
 
     # Try direct attribute
     try:
-        from functools import reduce
         return reduce(getattr, num_experts_attr.split("."), module)
     except AttributeError:
         pass
@@ -474,7 +468,6 @@ def _get_top_k_from_module(module: nn.Module, model_attrs: Dict[str, Any]) -> in
                 return getattr(module.config, config_key)
 
     try:
-        from functools import reduce
         return reduce(getattr, top_k_attr.split("."), module)
     except AttributeError:
         pass

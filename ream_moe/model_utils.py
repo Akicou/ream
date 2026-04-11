@@ -11,11 +11,9 @@ This module provides helper functions for:
 from __future__ import annotations
 
 import logging
-import re
 from functools import reduce
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import torch
 import torch.nn as nn
 
 from ream_moe.model_attr_configs import MODEL_ATTRS, get_model_attrs
@@ -457,7 +455,7 @@ def verify_model_config(model_name: str, model: nn.Module | None = None) -> Dict
         if missing_fields:
             errors.append(f"MODEL_ATTRS missing required fields: {missing_fields}")
         else:
-            logger.info(f"✅ All required MODEL_ATTRS fields present")
+            logger.info("✅ All required MODEL_ATTRS fields present")
 
     # Step 3: If model provided, verify structure matches MODEL_ATTRS
     if model is not None and model_attrs:
@@ -466,7 +464,7 @@ def verify_model_config(model_name: str, model: nn.Module | None = None) -> Dict
             if structure_errors:
                 errors.extend(structure_errors)
             else:
-                logger.info(f"✅ Model structure matches MODEL_ATTRS")
+                logger.info("✅ Model structure matches MODEL_ATTRS")
         except Exception as e:
             errors.append(f"Failed to verify model structure: {e}")
 
@@ -509,7 +507,6 @@ def _verify_model_structure(
         return ["MODEL_ATTRS missing 'moe_block' path"]
 
     moe_block = None
-    moe_layer_idx = None
 
     for layer_idx in range(min(10, len(layers))):  # Check first 10 layers
         layer = layers[layer_idx]
@@ -538,12 +535,11 @@ def _verify_model_structure(
 
             if found and temp is not None:
                 moe_block = current
-                moe_layer_idx = layer_idx
                 logger.info(f"✅ Found MoE block in layer {layer_idx}: {moe_block.__class__.__name__}")
                 break
 
     if moe_block is None:
-        errors.append(f"Could not find MoE block with 'experts' in first 10 layers")
+        errors.append("Could not find MoE block with 'experts' in first 10 layers")
         return errors
 
     # Check experts
@@ -629,7 +625,7 @@ def print_verification_result(result: Dict[str, Any]) -> None:
         print("\n❌ Configuration has ERRORS - compression will likely FAIL!")
 
     if result["model_attrs"]:
-        print(f"\n🔧 MODEL_ATTRS:")
+        print("\n🔧 MODEL_ATTRS:")
         for key, value in result["model_attrs"].items():
             print(f"   {key}: {value}")
 

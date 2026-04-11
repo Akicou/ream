@@ -55,8 +55,87 @@ Basic usage:
 
 import logging
 
+# Observer - collect activation statistics
+from ream_moe.observer import (
+    MoEObserver,
+    ObserverConfig,
+    observe_model,
+)
+
+# Pruning - remove experts
+from ream_moe.prune import (
+    PruningConfig,
+    prune_model,
+    prune_layer,
+    compute_experts_to_prune,
+)
+
+# Merging - combine experts
+from ream_moe.merge import (
+    MergeConfig,
+    merge_model,
+    merge_layer,
+)
+
+# Model configurations
+from ream_moe.model_attr_configs import (
+    MODEL_ATTRS,
+    get_model_attrs,
+    list_supported_models,
+)
+
+# Observer configurations
+from ream_moe.observer_configs import (
+    OBSERVER_CONFIG_REGISTRY,
+    ObserverHookConfig,
+    get_observer_config,
+    create_observer_config,
+    list_supported_observer_models,
+)
+
+# Model utilities
+from ream_moe.model_utils import (
+    get_moe_block,
+    get_num_experts,
+    get_top_k,
+    list_moe_layers,
+    ensure_model_registered,
+    verify_model_config,
+    print_verification_result,
+)
+
 # Version info
 __version__ = "0.1.0"
+
+# Public API
+__all__ = [
+    "setup_logging",
+    "MoEObserver",
+    "ObserverConfig",
+    "observe_model",
+    "PruningConfig",
+    "prune_model",
+    "prune_layer",
+    "compute_experts_to_prune",
+    "MergeConfig",
+    "merge_model",
+    "merge_layer",
+    "MODEL_ATTRS",
+    "get_model_attrs",
+    "list_supported_models",
+    "OBSERVER_CONFIG_REGISTRY",
+    "ObserverHookConfig",
+    "get_observer_config",
+    "create_observer_config",
+    "list_supported_observer_models",
+    "get_moe_block",
+    "get_num_experts",
+    "get_top_k",
+    "list_moe_layers",
+    "ensure_model_registered",
+    "verify_model_config",
+    "print_verification_result",
+]
 
 
 def setup_logging(level: str = "WARNING") -> None:
@@ -95,100 +174,3 @@ def setup_logging(level: str = "WARNING") -> None:
     ]
     for logger_name in noisy_loggers:
         logging.getLogger(logger_name).setLevel(numeric_level)
-
-# Public API
-__all__ = [
-    "setup_logging",
-]
-
-# Observer - collect activation statistics
-from ream_moe.observer import (
-    MoEObserver,
-    ObserverConfig,
-    observe_model,
-)
-
-__all__.extend([
-    "MoEObserver",
-    "ObserverConfig",
-    "observe_model",
-])
-
-# Pruning - remove experts
-from ream_moe.prune import (
-    PruningConfig,
-    prune_model,
-    prune_layer,
-    compute_experts_to_prune,
-)
-
-__all__.extend([
-    "PruningConfig",
-    "prune_model",
-    "prune_layer",
-    "compute_experts_to_prune",
-])
-
-# Merging - combine experts
-from ream_moe.merge import (
-    MergeConfig,
-    merge_model,
-    merge_layer,
-)
-
-__all__.extend([
-    "MergeConfig",
-    "merge_model",
-    "merge_layer",
-])
-
-# Model configurations
-from ream_moe.model_attr_configs import (
-    MODEL_ATTRS,
-    get_model_attrs,
-    list_supported_models,
-)
-
-__all__.extend([
-    "MODEL_ATTRS",
-    "get_model_attrs",
-    "list_supported_models",
-])
-
-# Observer configurations
-from ream_moe.observer_configs import (
-    OBSERVER_CONFIG_REGISTRY,
-    ObserverHookConfig,
-    get_observer_config,
-    create_observer_config,
-    list_supported_observer_models,
-)
-
-__all__.extend([
-    "OBSERVER_CONFIG_REGISTRY",
-    "ObserverHookConfig",
-    "get_observer_config",
-    "create_observer_config",
-    "list_supported_observer_models",
-])
-
-# Model utilities
-from ream_moe.model_utils import (
-    get_moe_block,
-    get_num_experts,
-    get_top_k,
-    list_moe_layers,
-    ensure_model_registered,
-    verify_model_config,
-    print_verification_result,
-)
-
-__all__.extend([
-    "get_moe_block",
-    "get_num_experts",
-    "get_top_k",
-    "list_moe_layers",
-    "ensure_model_registered",
-    "verify_model_config",
-    "print_verification_result",
-])

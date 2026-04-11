@@ -1,13 +1,60 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Protocol
 
 import torch
 from torch import Tensor
 from scipy.optimize import linear_sum_assignment
 
 from .calibration import CalibrationBatch
+
+
+class MoEAdapter(Protocol):
+    """Protocol defining the interface for MoE model adapters."""
+    
+    def moe_layers(self) -> List[Any]:
+        """Return list of MoE layers."""
+        ...
+    
+    def forward_collect_calibration(
+        self,
+        calib_batches: Iterable[CalibrationBatch],
+        max_tokens: int,
+    ) -> Dict[Any, Dict[str, Tensor]]:
+        """Run forward pass and collect calibration statistics."""
+        ...
+    
+    def top_k(self, layer: Any) -> int:
+        """Get top-k value for a layer."""
+        ...
+    
+    def get_expert_weights(self, layer: Any) -> Tensor:
+        """Get expert weights from a layer."""
+        ...
+    
+    def set_expert_weights(self, layer: Any, weights: Tensor) -> None:
+        """Set expert weights on a layer."""
+        ...
+    
+    def get_router_weights(self, layer: Any) -> Tensor:
+        """Get router weights from a layer."""
+        ...
+    
+    def set_router_weights(self, layer: Any, router: Tensor) -> None:
+        """Set router weights on a layer."""
+        ...
+    
+    def router_expert_axis(self, layer: Any) -> int:
+        """Get the expert axis dimension for router weights."""
+        ...
+    
+    def rebuild_caches(self) -> None:
+        """Rebuild any cached state after modifications."""
+        ...
+
+
+MoELayerHandle = Any
 
 
 @dataclass
