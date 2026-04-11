@@ -150,16 +150,34 @@ def _compute_saliency_scores(
     actual_top_k = min(actual_top_k, N)
     topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
+    # Memory-efficient vectorized approach: iterate but with batched operations
     saliency = torch.zeros(N, device=router_logits.device)
-
-    for i in range(N):
-        token_idx, within_topk_idx = torch.where(topk_idx == i)
-        if token_idx.numel() == 0:
-            continue
-
-        h_i = expert_outputs[i, token_idx]
-        p_i = topk_vals[token_idx, within_topk_idx]
-        saliency[i] = (h_i.norm(dim=-1) * p_i).mean()
+    
+    # Process in chunks to balance memory and speed
+    chunk_size = max(1, N // 8)  # Process 1/8 of experts at a time
+    
+    for start_idx in range(0, N, chunk_size):
+        end_idx = min(start_idx + chunk_size, N)
+        
+        # For this chunk of experts, find all positions where they appear in top-k
+        chunk_experts = torch.arange(start_idx, end_idx, device=topk_idx.device)
+        
+        # Create mask: [T, top_k, chunk_size]
+        mask = (topk_idx.unsqueeze(-1) == chunk_experts.unsqueeze(0).unsqueeze(0))  # [T, top_k, chunk_size]
+        
+        # Get corresponding values
+        chunk_saliency = torch.zeros(end_idx - start_idx, device=router_logits.device)
+        
+        for local_idx, global_idx in enumerate(chunk_experts.tolist()):
+            expert_mask = mask[..., local_idx]  # [T, top_k]
+            if expert_mask.any():
+                # Get token positions and within-topk positions
+                token_idx, within_topk_idx = torch.where(expert_mask)
+                h_i = expert_outputs[global_idx, token_idx]
+                p_i = topk_vals[token_idx, within_topk_idx]
+                chunk_saliency[local_idx] = (h_i.norm(dim=-1) * p_i).mean()
+        
+        saliency[start_idx:end_idx] = chunk_saliency
 
     return saliency
 
@@ -201,10 +219,10 @@ def _group_experts_around_centroids(
     # not just a collapsed scalar (which was near-meaningless before).
     expert_repr_router = router_logits.T  # [N, T]
 
-    def cosine_sim(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-        a_norm = a / (a.norm(dim=-1, keepdim=True) + eps)
-        b_norm = b / (b.norm(dim=-1, keepdim=True) + eps)
-        return (a_norm * b_norm).sum(dim=-1)
+    # Pre-normalize all expert representations once (OPTIMIZATION)
+    eps = 1e-8
+    expert_repr_hidden_norm = expert_repr_hidden / (expert_repr_hidden.norm(dim=-1, keepdim=True) + eps)
+    expert_repr_router_norm = expert_repr_router / (expert_repr_router.norm(dim=-1, keepdim=True) + eps)
 
     groups: List[List[int]] = []
 
@@ -222,18 +240,13 @@ def _group_experts_around_centroids(
             groups.append(group)
             break
 
-        # Compute similarities
-        sim_hidden = cosine_sim(
-            expert_repr_hidden[unused_idx],
-            expert_repr_hidden[c_idx].expand_as(expert_repr_hidden[unused_idx]),
-        )
-
-        # Cosine similarity over full routing distribution [T] — compares which tokens
-        # each expert is activated for, not just a single scalar mean value.
-        sim_router = cosine_sim(
-            expert_repr_router[unused_idx],   # [n_unused, T]
-            expert_repr_router[c_idx],        # [T] — broadcasts to [n_unused, T]
-        )
+        # Compute similarities using pre-normalized representations (OPTIMIZATION)
+        c_hidden_norm = expert_repr_hidden_norm[c_idx]  # [D]
+        c_router_norm = expert_repr_router_norm[c_idx]  # [T]
+        
+        # Dot product with pre-normalized vectors = cosine similarity
+        sim_hidden = (expert_repr_hidden_norm[unused_idx] * c_hidden_norm).sum(dim=-1)
+        sim_router = (expert_repr_router_norm[unused_idx] * c_router_norm).sum(dim=-1)
 
         if config.use_gated_similarity:
             sim = 0.5 * (sim_hidden + sim_router)
@@ -258,6 +271,35 @@ def _group_experts_around_centroids(
         groups.append([int(r.item())])
 
     return groups
+
+
+def _solve_hungarian_permutation(
+    ref: torch.Tensor,
+    candidate: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Solve Hungarian algorithm to find optimal neuron permutation.
+    
+    Args:
+        ref: Reference expert weights [I, 3H]
+        candidate: Candidate expert weights to permute [I, 3H]
+        device: Target device for the permutation tensor
+        
+    Returns:
+        Permutation indices [I]
+    """
+    # Pairwise Euclidean distance between neuron vectors [I, 3H] → cost [I, I]
+    # BFloat16 is unsupported by torch.cdist on CPU; upcast to float32.
+    if not device.type.startswith("cuda") and (
+        ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16
+    ):
+        cost = torch.cdist(ref.float(), candidate.float())
+    else:
+        cost = torch.cdist(ref, candidate)
+    
+    _row, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+    return torch.as_tensor(col_ind, device=device, dtype=torch.long)
 
 
 def _merge_groups(
@@ -291,8 +333,8 @@ def _merge_groups(
 
     for group in groups:
         if len(group) == 1:
-            # Singleton: keep original weights unchanged
-            merged_list.append(all_weights[group[0]].detach().clone())
+            # Singleton: keep original weights unchanged (no clone needed for singletons)
+            merged_list.append(all_weights[group[0]])
             continue
 
         G = len(group)
@@ -311,22 +353,13 @@ def _merge_groups(
             # For each non-centroid expert, find the neuron permutation that best
             # aligns it to the centroid, then accumulate the weighted average.
             ref = group_tensor[0]                  # [I, 3H] — centroid as reference
-            weights_accum = s_norm[0] * ref.clone()
+            weights_accum = s_norm[0] * ref
 
             for g_idx in range(1, G):
                 candidate = group_tensor[g_idx]    # [I, 3H]
-
-                # Pairwise Euclidean distance between neuron vectors [I, 3H] → cost [I, I]
-                # BFloat16 is unsupported by torch.cdist on CPU; upcast to float32.
-                if not device.type.startswith("cuda") and (
-                    ref.dtype == torch.bfloat16 or candidate.dtype == torch.bfloat16
-                ):
-                    cost = torch.cdist(ref.float(), candidate.float())
-                else:
-                    cost = torch.cdist(ref, candidate)
-
-                _row, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-                perm = torch.as_tensor(col_ind, device=device, dtype=torch.long)
+                
+                # Use extracted Hungarian function (better code organization)
+                perm = _solve_hungarian_permutation(ref, candidate, device)
 
                 permuted = candidate[perm]         # [I, 3H] — neurons reordered to match ref
                 weights_accum = weights_accum + s_norm[g_idx] * permuted

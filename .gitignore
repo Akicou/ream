@@ -1,92 +1,35 @@
-# Byte-compiled / optimized / DLL files
+```
+# Compiled and build artifacts
+*.pyc
 __pycache__/
-*.py[cod]
-*$py.class
 
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-pip-delete-this-directory.txt
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
+# Dependencies
+.venv/
+venv/
+.mypy_cache/
 .pytest_cache/
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Vibecoding settings (claude, etc)
-.claude/
-.claude-*
-*vibecoding*
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Model files (large)
-*.bin
-*.safetensors
-*.pt
-*.pth
-*.ckpt
-
-# Logs
+# Logs and temp files
 *.log
-logs/
-
-# Data
-data/
-datasets/
-
-# Outputs
-outputs/
-results/
-compressed_models/
-
-# Temporary files
-tmp/
-temp/
 *.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Distribution artifacts
+dist/
+build/
+target/
+```
