@@ -10,7 +10,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List
 
 import torch
 from torch.utils.data import DataLoader, Dataset

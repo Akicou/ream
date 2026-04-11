@@ -21,7 +21,6 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -39,7 +38,6 @@ from ream_moe import (
     verify_model_config,
     print_verification_result,
     ensure_model_registered,
-    list_supported_models,
 )
 from ream_moe.calibration import build_calibration_batches, list_available_datasets
 

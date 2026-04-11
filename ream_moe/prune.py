@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,6 @@ from tqdm import tqdm
 
 from ream_moe.model_attr_configs import get_model_attrs
 from ream_moe.model_utils import get_moe_block, get_num_experts, ensure_model_registered
-from ream_moe.observer import LayerObserverState
 
 logger = logging.getLogger(__name__)
 

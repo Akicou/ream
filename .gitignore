@@ -1,10 +1,21 @@
-# Byte-compiled / optimized / DLL files
+```
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.ENV
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
 
-# C extensions
-*.so
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
 
 # Distribution / packaging
 .Python
@@ -20,73 +31,32 @@ parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
-pip-delete-this-directory.txt
+*.egg-info/
+.installed.cfg
+*.egg
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
+# Pytest
 .pytest_cache/
+.coverage
+coverage/
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+# Mypy
+.mypy_cache/
 
-# IDE
-.idea/
+# VSCode
 .vscode/
-*.swp
-*.swo
-*~
 
-# Vibecoding settings (claude, etc)
-.claude/
-.claude-*
-*vibecoding*
+# Environment variables
+.env
+.env.local
+*.env
 
-# OS
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
-
-# Model files (large)
-*.bin
-*.safetensors
-*.pt
-*.pth
-*.ckpt
-
-# Logs
-*.log
-logs/
-
-# Data
-data/
-datasets/
-
-# Outputs
-outputs/
-results/
-compressed_models/
-
-# Temporary files
-tmp/
-temp/
-*.tmp
+```

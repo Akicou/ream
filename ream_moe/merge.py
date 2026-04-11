@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,6 @@ from tqdm import tqdm
 
 from ream_moe.model_attr_configs import get_model_attrs
 from ream_moe.model_utils import get_moe_block, get_num_experts
-from ream_moe.observer import LayerObserverState
 
 logger = logging.getLogger(__name__)
 
@@ -353,8 +352,6 @@ def _get_expert_weights(
         down = experts.down_proj  # [E, H, I]
 
         num_experts = gate_up.shape[0]
-        intermediate_size = down.shape[2]
-        hidden_dim = gate_up.shape[2]
 
         # Stack as [gate, up, down] flattened
         weights = []
