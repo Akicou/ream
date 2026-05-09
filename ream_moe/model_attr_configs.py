@@ -228,6 +228,22 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts_per_tok": "num_experts_per_tok",
     },
 
+    # MiMo V2.5 (Xiaomi) - multimodal MoE, 256 routed experts, top_k=8.
+    # Extracted from XiaomiMiMo/MiMo-V2.5 safetensors headers:
+    # model.layers.N.mlp.experts.[0-255].{gate,up,down}_proj and
+    # model.layers.N.mlp.gate.{weight,e_score_correction_bias}.
+    "MiMoV2ForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "gate.top_k",
+    },
+
     # MiMo V2 Flash (Xiaomi) - 309B MoE model
     "MiMoV2FlashForCausalLM": {
         "moe_block": "mlp",

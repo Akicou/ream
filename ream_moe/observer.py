@@ -314,21 +314,33 @@ class MoEObserver:
 
             if hasattr(router, "score_fn"):
                 scores = router.score_fn(router_logits.float())
+            elif getattr(router, "scoring_func", None) == "sigmoid":
+                scores = router_logits.float().sigmoid()
             else:
                 scores = torch.softmax(router_logits, dim=-1)
 
             routing_weights = torch.gather(scores, dim=-1, index=selected_experts)
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
 
-            if hasattr(router, "routed_scaling_factor"):
-                routing_weights = routing_weights * router.routed_scaling_factor
+            routed_scaling_factor = getattr(router, "routed_scaling_factor", None)
+            if routed_scaling_factor is not None:
+                routing_weights = routing_weights * routed_scaling_factor
 
             return selected_experts, routing_weights.to(router_logits.dtype)
 
-        # DeepSeek-style top-k routers use a non-softmax score function and
-        # normalize only the selected expert weights.
-        if router is not None and hasattr(router, "score_fn"):
-            scores = router.score_fn(router_logits.float())
+        # DeepSeek/MiMo-style top-k routers use a non-softmax score function and
+        # normalize only the selected expert weights. MiMoV2 noaux_tc also has
+        # optional grouped top-k routing.
+        if router is not None and (hasattr(router, "score_fn") or hasattr(router, "scoring_func")):
+            if hasattr(router, "score_fn"):
+                scores = router.score_fn(router_logits.float())
+            elif getattr(router, "scoring_func", None) == "sigmoid":
+                scores = router_logits.float().sigmoid()
+            else:
+                raise NotImplementedError(
+                    f"Unsupported MoE router scoring_func={getattr(router, 'scoring_func', None)!r}"
+                )
+
             selection_scores = scores
             correction_bias = getattr(router, "e_score_correction_bias", None)
             if correction_bias is None:
@@ -336,12 +348,30 @@ class MoEObserver:
             if correction_bias is not None:
                 selection_scores = selection_scores + correction_bias.to(selection_scores.device)
 
+            if getattr(router, "topk_method", None) == "noaux_tc" and hasattr(router, "n_group") and getattr(router, "n_group"):
+                n_group = int(router.n_group)
+                topk_group = int(getattr(router, "topk_group", n_group))
+                if n_group > 1:
+                    num_experts = selection_scores.shape[-1]
+                    group_scores = selection_scores.view(selection_scores.shape[0], n_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+                    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False).indices
+                    group_mask = torch.zeros_like(group_scores)
+                    group_mask.scatter_(1, group_idx, 1)
+                    score_mask = (
+                        group_mask.unsqueeze(-1)
+                        .expand(selection_scores.shape[0], n_group, num_experts // n_group)
+                        .reshape(selection_scores.shape[0], -1)
+                    )
+                    selection_scores = selection_scores.masked_fill(~score_mask.bool(), float("-inf"))
+
             selected_experts = torch.topk(selection_scores, k=top_k, dim=-1, sorted=False).indices
             topk_vals = torch.gather(scores, dim=-1, index=selected_experts)
-            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+            if getattr(router, "norm_topk_prob", True) or self.config.renormalize_router_weights:
+                topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-20)
 
-            if hasattr(router, "routed_scaling_factor"):
-                topk_vals = topk_vals * router.routed_scaling_factor
+            routed_scaling_factor = getattr(router, "routed_scaling_factor", None)
+            if routed_scaling_factor is not None:
+                topk_vals = topk_vals * routed_scaling_factor
 
             return selected_experts, topk_vals.to(router_logits.dtype)
 
@@ -407,9 +437,13 @@ class MoEObserver:
                     device=flat_input.device, dtype=flat_input.dtype
                 )
 
-            # Compute logits. DeepSeek-style routers use `bias` as a correction
-            # term after the score function, not as a linear bias.
-            linear_bias = None if (hasattr(router, "score_fn") or hasattr(router, "tid2eid")) else bias
+            # Compute logits. DeepSeek/MiMo-style routers use correction biases
+            # after the score function, not as a linear bias.
+            linear_bias = None if (
+                hasattr(router, "score_fn")
+                or hasattr(router, "scoring_func")
+                or hasattr(router, "tid2eid")
+            ) else bias
             logits = F.linear(flat_input.to(weight.dtype), weight, linear_bias)
             return logits
 

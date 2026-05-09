@@ -201,7 +201,16 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
         },
     ),
 
-    # MiMo V2 Flash
+    # MiMo V2.5 / V2 Flash
+    "MiMoV2ForCausalLM": type(
+        "MiMoV2ObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "MiMoV2MoE",
+            "num_experts_attr_name": "n_routed_experts",
+            "top_k_attr_name": "gate.top_k",
+        },
+    ),
     "MiMoV2FlashForCausalLM": type(
         "MiMoV2FlashObserverConfig",
         (ObserverHookConfig,),

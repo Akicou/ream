@@ -14,7 +14,7 @@ Supported model families:
 - Ernie (Ernie4_5_MoEForCausalLM, Ernie4_5_MoeForCausalLM)
 - Solar (SolarOpenForCausalLM)
 - Vaetki (VaetkiForCausalLM)
-- MiMo (MiMoV2FlashForCausalLM)
+- MiMo (MiMoV2ForCausalLM, MiMoV2FlashForCausalLM)
 - LongCat (LongcatCausalLM, LongcatForCausalLM)
 - MiniMax (MiniMaxM2ForCausalLM)
 

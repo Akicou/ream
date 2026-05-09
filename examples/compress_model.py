@@ -74,6 +74,9 @@ Examples:
 
   # Verify model configuration only
   python compress_model.py --model Qwen/Qwen3-14B-MoE --verify-only
+
+  # Offline random seed pruning directly on safetensors (no model load / no GPU)
+  python compress_model.py --model ./DeepSeek-V4-Flash-Base --output ./DeepSeek-V4-Flash-Base-100B --offline-seed-prune --n-experts 177
         """
     )
 
@@ -116,6 +119,15 @@ Examples:
         type=int,
         default=None,
         help="Exact number of experts to prune (overrides compression-ratio)",
+    )
+    parser.add_argument(
+        "--offline-seed-prune",
+        action="store_true",
+        help=(
+            "Randomly prune experts directly in safetensors using --seed without "
+            "loading a Transformers model or using GPU. Works from a local model "
+            "directory or HF repo id; no calibration is used."
+        ),
     )
 
     # Calibration arguments
@@ -425,6 +437,33 @@ def save_model(model, tokenizer, output_dir, args, retained_counts=None):
 def main():
     """Main entry point."""
     args = parse_args()
+
+    if args.offline_seed_prune:
+        if args.method != "prune":
+            logger.error("--offline-seed-prune only supports --method prune")
+            sys.exit(1)
+
+        from ream_moe.offline_prune import offline_seed_prune_safetensors
+
+        result = offline_seed_prune_safetensors(
+            args.model,
+            args.output,
+            n_experts_to_prune=args.n_experts,
+            compression_ratio=args.compression_ratio,
+            seed=args.seed,
+        )
+        logger.warning("=" * 70)
+        logger.warning("Offline seed pruning complete!")
+        logger.warning(f"Source: {result.source_dir}")
+        logger.warning(f"Output: {result.output_dir}")
+        logger.warning(
+            f"Experts per layer: {result.original_experts} -> {result.retained_experts} "
+            f"({result.pruned_experts} pruned)"
+        )
+        logger.warning(f"Layers processed: {result.num_layers}")
+        logger.warning(f"Output safetensors payload: {result.output_total_size_bytes / 1e9:.2f} GB")
+        logger.warning("=" * 70)
+        return
 
     # Set random seed
     torch.manual_seed(args.seed)

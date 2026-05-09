@@ -26,7 +26,7 @@
   - Ernie (Ernie4_5_MoEForCausalLM, Ernie4_5_MoeForCausalLM)
   - Solar (SolarOpenForCausalLM)
   - Vaetki (VaetkiForCausalLM)
-  - MiMo (MiMoV2FlashForCausalLM)
+  - MiMo (MiMoV2ForCausalLM, MiMoV2FlashForCausalLM)
   - LongCat (LongcatCausalLM, LongcatForCausalLM)
   - MiniMax (MiniMaxM2ForCausalLM)
 - **Multiple compression methods**:
@@ -134,6 +134,7 @@ retained_counts = merge_model(model, observer_data, config)
 | GLM-5 | `GlmMoeDsaForCausalLM` | No | Hybrid routed + shared |
 | Ernie 4.5 | `Ernie4_5_MoeForCausalLM` | No | Baidu MoE architecture |
 | Solar | `SolarOpenForCausalLM` | No | |
+| MiMo V2.5 | `MiMoV2ForCausalLM` | No | 256 experts, top_k=8, multimodal/audio |
 | MiMo V2 | `MiMoV2FlashForCausalLM` | No | 309B parameter model |
 | LongCat | `LongcatCausalLM` | No | 512 real + 256 zero experts |
 | MiniMax M2.5 | `MiniMaxM2ForCausalLM` | No | Uses w1/w2/w3 naming |
@@ -158,6 +159,7 @@ usage: compress_model.py [-h] --model MODEL --output OUTPUT
                           [--compression-ratio COMPRESSION_RATIO]
                           [--target-ratio TARGET_RATIO]
                           [--n-experts N_EXPERTS]
+                          [--offline-seed-prune]
                           [--dataset DATASET] [--samples SAMPLES]
                           [--max-seq-len MAX_SEQ_LEN]
                           [--batch-size BATCH_SIZE]
@@ -179,6 +181,7 @@ options:
   --target-ratio TARGET_RATIO
                         For merging: fraction of experts to KEEP
   --n-experts N_EXPERTS  Exact number of experts to prune
+  --offline-seed-prune  Randomly prune directly in safetensors without loading the model
   --dataset DATASET     Calibration dataset
   --samples SAMPLES      Number of samples for calibration (default: 1000)
   --max-seq-len MAX_SEQ_LEN
