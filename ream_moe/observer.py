@@ -289,13 +289,22 @@ class MoEObserver:
 
             # Handle nested router (e.g., router.classifier for LongCat)
             router_weight_attr = self.model_attrs.get("router_weight_attr")
+            bias = None
             if router_weight_attr and "." in router_weight_attr:
                 parts = router_weight_attr.split(".")
-                weight = reduce(getattr, parts, router)
+                inner = router
+                for part in parts[:-1]:
+                    inner = getattr(inner, part)
+                weight_attr = parts[-1]
+                weight = getattr(inner, weight_attr)
+                bias_attr = weight_attr.replace("weight", "bias")
+                bias = getattr(inner, bias_attr, None)
             elif hasattr(router, "weight"):
                 weight = router.weight
+                bias = getattr(router, "bias", None)
             elif hasattr(router, "classifier") and hasattr(router.classifier, "weight"):
                 weight = router.classifier.weight
+                bias = getattr(router.classifier, "bias", None)
             else:
                 # Fallback: create zeros
                 return torch.zeros(
@@ -304,7 +313,7 @@ class MoEObserver:
                 )
 
             # Compute logits
-            logits = F.linear(flat_input.to(weight.dtype), weight)
+            logits = F.linear(flat_input.to(weight.dtype), weight, bias)
             return logits
 
         # Fallback: create placeholder
@@ -388,7 +397,10 @@ class MoEObserver:
                 and state.saliency_scores is None
             ):
                 state.saliency_scores = self._compute_saliency(
-                    state.router_logits, state.expert_outputs, top_k=top_k
+                    state.router_logits,
+                    state.expert_outputs,
+                    top_k=top_k,
+                    renormalize_topk=self.config.renormalize_router_weights,
                 )
 
         # Convert to output format
@@ -408,6 +420,7 @@ class MoEObserver:
         router_logits: torch.Tensor,  # [num_tokens, num_experts]
         expert_outputs: torch.Tensor,  # [num_experts, num_tokens, hidden_dim]
         top_k: Optional[int] = None,
+        renormalize_topk: bool = False,
     ) -> torch.Tensor:
         """
         Compute REAP saliency scores per expert.
@@ -420,6 +433,9 @@ class MoEObserver:
             top_k: Actual number of experts activated per token (from model config).
                    Critical for correctness: only tokens where expert i was in the
                    top-k routing selection should contribute to its saliency score.
+            renormalize_topk: Whether to renormalize top-k router probabilities
+                   before weighting expert-output norms, matching Mixtral/Qwen-style
+                   routing implementations that normalize selected expert weights.
 
         Returns:
             Saliency scores [num_experts]
@@ -431,6 +447,8 @@ class MoEObserver:
         actual_top_k = top_k if top_k is not None else num_experts
         actual_top_k = min(actual_top_k, num_experts)
         topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
+        if renormalize_topk:
+            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         saliency = torch.zeros(num_experts, device=router_logits.device)
 

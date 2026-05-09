@@ -385,14 +385,20 @@ def save_model(model, tokenizer, output_dir, args, retained_counts=None):
 
     # Ensure config is updated before saving
     if retained_counts:
+        unique_counts = set(retained_counts.values())
         final_expert_count = list(retained_counts.values())[0] if retained_counts else None
-        if final_expert_count:
+        if final_expert_count and len(unique_counts) == 1:
             for attr_name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
                 if hasattr(model.config, attr_name):
                     old_val = getattr(model.config, attr_name)
                     if old_val != final_expert_count:
                         logger.info(f"Updating model.config.{attr_name}: {old_val} -> {final_expert_count}")
                         setattr(model.config, attr_name, final_expert_count)
+        elif len(unique_counts) > 1:
+            logger.warning(
+                f"Retained expert counts differ by layer ({unique_counts}); "
+                "skipping scalar model.config expert-count update."
+            )
 
     # Save model
     model.save_pretrained(output_path)

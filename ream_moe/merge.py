@@ -15,6 +15,7 @@ most of the original model's capability.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -24,7 +25,7 @@ from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 from ream_moe.model_attr_configs import get_model_attrs
-from ream_moe.model_utils import get_moe_block, get_num_experts, get_top_k
+from ream_moe.model_utils import get_moe_block, get_top_k
 from ream_moe.observer import LayerObserverState
 
 logger = logging.getLogger(__name__)
@@ -67,13 +68,19 @@ def merge_layer(
         raise ValueError(f"Model {model_class} not registered in MODEL_ATTRS")
 
     moe_block = get_moe_block(model, layer_idx)
-    num_experts = get_num_experts(model, layer_idx)
 
     router_logits = observer_stats.get("router_logits")  # [T, N]
     expert_outputs = observer_stats.get("expert_outputs")  # [N, T, D]
 
     if router_logits is None or expert_outputs is None:
         raise ValueError(f"Layer {layer_idx}: Missing required observer data")
+
+    num_experts = router_logits.shape[-1]
+    if expert_outputs.shape[0] != num_experts:
+        raise ValueError(
+            f"Layer {layer_idx}: router/expert shape mismatch "
+            f"({num_experts} router experts vs {expert_outputs.shape[0]} expert outputs)"
+        )
 
     # Step 1: Compute saliency scores using the model's actual top-k routing value
     try:
@@ -87,12 +94,13 @@ def merge_layer(
     )  # [N]
 
     # Step 2: Select centroids
-    target_experts = max(1, int(num_experts * config.target_ratio))
+    target_experts = min(num_experts, max(1, math.ceil(num_experts * config.target_ratio)))
     centroid_indices = torch.argsort(saliency, descending=True)[:target_experts]
+    actual_compression = 100 * (1 - target_experts / num_experts)
 
     logger.info(
         f"Layer {layer_idx}: Merging {num_experts} -> {target_experts} experts "
-        f"({100 * (1 - config.target_ratio):.0f}% compression)"
+        f"({actual_compression:.1f}% compression)"
     )
 
     # Step 3: Group experts around centroids
@@ -108,7 +116,7 @@ def merge_layer(
     )
 
     # Step 5: Update model with merged weights
-    _update_merged_weights(moe_block, merged_weights, groups, attrs)
+    _update_merged_weights(moe_block, merged_weights, groups, attrs, saliency)
 
     return len(groups)
 
@@ -209,6 +217,9 @@ def _group_experts_around_centroids(
     device = router_logits.device
     T, N = router_logits.shape
     used = torch.zeros(N, dtype=torch.bool, device=device)
+    centroid_indices = centroid_indices.to(device=device, dtype=torch.long)
+    centroid_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    centroid_mask[centroid_indices] = True
 
     probs = torch.softmax(router_logits, dim=-1)
 
@@ -234,11 +245,12 @@ def _group_experts_around_centroids(
         group = [c_idx]
         used[c_idx] = True
 
-        # Find unused candidates
-        unused_idx = torch.where(~used)[0]
+        # Find unused non-centroid candidates. Centroids are protected so high-
+        # saliency retained experts cannot be swallowed by earlier groups.
+        unused_idx = torch.where((~used) & (~centroid_mask))[0]
         if unused_idx.numel() == 0:
             groups.append(group)
-            break
+            continue
 
         # Compute similarities using pre-normalized representations (OPTIMIZATION)
         c_hidden_norm = expert_repr_hidden_norm[c_idx]  # [D]
@@ -302,6 +314,38 @@ def _solve_hungarian_permutation(
     return torch.as_tensor(col_ind, device=device, dtype=torch.long)
 
 
+def _normalise_group_saliency(
+    saliency: torch.Tensor,
+    group: List[int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Return stable merge weights for a group.
+
+    If calibration never routed any expert in the group, all saliency values can
+    be zero. In that case a naive normalization would produce an all-zero merged
+    expert, so we preserve the centroid (group[0]) instead.
+    """
+    idx = torch.as_tensor(group, device=device, dtype=torch.long)
+    vals = saliency.to(device=device)[idx].float()
+
+    pos_inf = torch.isinf(vals) & (vals > 0)
+    if pos_inf.any():
+        weights = pos_inf.float() / pos_inf.float().sum()
+        return weights.to(dtype=dtype)
+
+    vals = torch.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    total = vals.sum()
+
+    if torch.isfinite(total).item() and total.item() > 1e-8:
+        return (vals / total).to(dtype=dtype)
+
+    weights = torch.zeros_like(vals)
+    weights[0] = 1.0
+    return weights.to(dtype=dtype)
+
+
 def _merge_groups(
     moe_block: nn.Module,
     groups: List[List[int]],
@@ -340,9 +384,9 @@ def _merge_groups(
         G = len(group)
         group_tensor = all_weights[group]  # [G, I, 3H]
 
-        # Saliency-normalised weights for this group
-        s_vals = saliency.to(device)[torch.tensor(group, device=device)]
-        s_norm = s_vals / (s_vals.sum() + 1e-8)
+        # Saliency-normalised weights for this group. Falls back to the
+        # centroid if calibration provides no signal for this group.
+        s_norm = _normalise_group_saliency(saliency, group, device, group_tensor.dtype)
 
         if skip_permutation:
             # Fast path: saliency-weighted average without neuron permutation.
@@ -445,6 +489,7 @@ def _update_merged_weights(
     merged_weights: torch.Tensor,  # [num_groups, I, 3H]
     groups: List[List[int]],
     attrs: Dict[str, Any],
+    saliency: torch.Tensor,
 ) -> None:
     """
     Write merged expert weights back to the model and update the router.
@@ -518,63 +563,109 @@ def _update_merged_weights(
         experts_attr = attrs.get("experts", "experts")
         setattr(moe_block, experts_attr, new_experts)
 
-    # Shrink router to output only the centroid experts
-    _update_router_for_merge(moe_block, groups, attrs)
+    # Shrink router to one output per merged expert group
+    _update_router_for_merge(moe_block, groups, attrs, saliency)
 
 
 def _update_router_for_merge(
     moe_block: nn.Module,
     groups: List[List[int]],
     attrs: Dict[str, Any],
+    saliency: torch.Tensor,
 ) -> None:
     """
-    Update router weights to only output centroids (first expert in each group).
+    Update router weights to output one merged route per expert group.
 
     Args:
         moe_block: The MoE block
         groups: Expert groups (first element of each is the centroid)
         attrs: Model attributes
+        saliency: Per-expert saliency scores used for weighted router merging
     """
     router_attr = attrs.get("router", "gate")
     router_weight_attr = attrs.get("router_weight_attr")
+    router = getattr(moe_block, router_attr)
 
-    centroid_indices = [g[0] for g in groups]
-    idx_tensor = torch.as_tensor(
-        centroid_indices, device=getattr(moe_block, router_attr).weight.device
-    )
+    def merge_expert_rows(tensor: torch.Tensor) -> torch.Tensor:
+        """Merge row-0 expert axis using the same saliency weights as experts."""
+        merged_rows: List[torch.Tensor] = []
+        for group in groups:
+            idx = torch.as_tensor(group, device=tensor.device, dtype=torch.long)
+            selected = tensor[idx]
+            weights = _normalise_group_saliency(saliency, group, tensor.device, selected.dtype)
+            view_shape = (len(group),) + (1,) * (selected.ndim - 1)
+            merged_rows.append((selected * weights.view(view_shape)).sum(dim=0))
+        return torch.stack(merged_rows, dim=0)
+
+    def merge_expert_columns(tensor: torch.Tensor) -> torch.Tensor:
+        """Merge last expert axis, used by some correction-bias tensors."""
+        merged_cols: List[torch.Tensor] = []
+        for group in groups:
+            idx = torch.as_tensor(group, device=tensor.device, dtype=torch.long)
+            selected = torch.index_select(tensor, dim=-1, index=idx)
+            weights = _normalise_group_saliency(saliency, group, tensor.device, selected.dtype)
+            view_shape = (1,) * (selected.ndim - 1) + (len(group),)
+            merged_cols.append((selected * weights.view(view_shape)).sum(dim=-1))
+        return torch.stack(merged_cols, dim=-1)
 
     if router_weight_attr and "." in router_weight_attr:
         # Handle nested router (e.g., LongCat's router.classifier)
         parts = router_weight_attr.split(".")
-        router = getattr(moe_block, router_attr)
         inner = router
         for part in parts[:-1]:
             inner = getattr(inner, part)
 
         weight_attr = parts[-1]
-        setattr(inner, weight_attr, getattr(inner, weight_attr)[idx_tensor])
+        weight = getattr(inner, weight_attr)
+        new_weight = merge_expert_rows(weight.data if isinstance(weight, nn.Parameter) else weight)
+        if isinstance(weight, nn.Parameter):
+            weight.data = new_weight
+        else:
+            setattr(inner, weight_attr, new_weight)
 
         # Update bias if present
         bias_attr = weight_attr.replace("weight", "bias")
         if hasattr(inner, bias_attr) and getattr(inner, bias_attr) is not None:
-            setattr(inner, bias_attr, getattr(inner, bias_attr)[idx_tensor])
+            bias = getattr(inner, bias_attr)
+            new_bias = merge_expert_rows(bias.data if isinstance(bias, nn.Parameter) else bias)
+            if isinstance(bias, nn.Parameter):
+                bias.data = new_bias
+            else:
+                setattr(inner, bias_attr, new_bias)
 
         # Update out_features
         if hasattr(inner, "out_features"):
-            inner.out_features = len(centroid_indices)
+            inner.out_features = len(groups)
+
+        if hasattr(router, "n_routed_experts"):
+            router.n_routed_experts = len(groups)
 
     else:
-        # Standard router
-        router = getattr(moe_block, router_attr)
-        router.weight.data = router.weight.data[idx_tensor]
+        # Standard router. Average grouped router rows instead of copying only
+        # centroid rows, so tokens that routed to merged-away experts can still
+        # reach the merged expert.
+        router.weight.data = merge_expert_rows(router.weight.data)
 
         if getattr(router, "bias", None) is not None:
-            router.bias.data = router.bias.data[idx_tensor]
+            router.bias.data = merge_expert_rows(router.bias.data)
 
-        router.out_features = len(centroid_indices)
+        router.out_features = len(groups)
 
         if hasattr(router, "num_experts"):
-            router.num_experts = len(centroid_indices)
+            router.num_experts = len(groups)
+
+    # Handle router-side correction biases if present.
+    if hasattr(router, "e_score_correction_bias"):
+        bias = router.e_score_correction_bias
+        if bias.ndim == 1:
+            bias.data = merge_expert_rows(bias.data)
+        elif bias.shape[-1] >= max(max(g) for g in groups) + 1:
+            bias.data = merge_expert_columns(bias.data)
+
+    if hasattr(moe_block, "moe_statics") and hasattr(moe_block.moe_statics, "e_score_correction_bias"):
+        bias = moe_block.moe_statics.e_score_correction_bias
+        if bias.shape[-1] >= max(max(g) for g in groups) + 1:
+            bias.data = merge_expert_columns(bias.data)
 
 
 def merge_model(
@@ -613,18 +704,17 @@ def merge_model(
         if len(unique_counts) > 1:
             logger.warning(
                 f"Layers have different retained expert counts after merging: {unique_counts}. "
-                f"model.config will be updated to the first layer's count ({final_expert_count}), "
-                f"which may not reflect per-layer differences (e.g. NonUniform models)."
+                "Skipping scalar model.config expert-count update."
             )
-
-        for attr_name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
-            if hasattr(model.config, attr_name):
-                logger.info(f"Updating model.config.{attr_name} = {final_expert_count}")
-                setattr(model.config, attr_name, final_expert_count)
+        else:
+            for attr_name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
+                if hasattr(model.config, attr_name):
+                    logger.info(f"Updating model.config.{attr_name} = {final_expert_count}")
+                    setattr(model.config, attr_name, final_expert_count)
 
     # Log summary
     if retained_counts:
-        original_avg = sum(len(s.get("router_logits", [])[0]) if "router_logits" in s else 0 for s in observer_data.values()) / len(observer_data)
+        original_avg = sum(s["router_logits"].shape[-1] if "router_logits" in s else 0 for s in observer_data.values()) / len(observer_data)
         merged_avg = sum(retained_counts.values()) / len(retained_counts)
         compression = (1 - merged_avg / original_avg) * 100 if original_avg > 0 else 0
 

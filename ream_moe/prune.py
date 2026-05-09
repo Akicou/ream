@@ -20,7 +20,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from ream_moe.model_attr_configs import get_model_attrs
-from ream_moe.model_utils import get_moe_block, get_num_experts, ensure_model_registered
+from ream_moe.model_utils import get_moe_block, ensure_model_registered
 from ream_moe.observer import LayerObserverState
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,54 @@ class PruningConfig:
     compression_ratio: float = 0.25  # Fraction of experts to prune (0.25 = prune 25%)
     preserve_super_experts: bool = False  # Don't prune experts with max activation > threshold
     super_expert_quantile: float = 99.5  # Quantile threshold for super experts
+
+
+def _get_num_experts_from_moe_block(
+    moe_block: nn.Module,
+    attrs: Dict[str, Any],
+) -> int:
+    """
+    Count experts from the layer module itself, not from model.config.
+
+    During pruning the global config may be updated only after all layers are
+    processed. Reading model.config inside each layer can cascade the first
+    layer's reduced count into later, still-unpruned layers.
+    """
+    experts_attr = attrs.get("experts", "experts")
+    current: Any = moe_block
+    for part in experts_attr.split("."):
+        current = getattr(current, part)
+    experts = current
+
+    if attrs.get("fused", False) and hasattr(experts, "gate_up_proj"):
+        return int(experts.gate_up_proj.shape[0])
+
+    try:
+        return int(len(experts))
+    except TypeError:
+        pass
+
+    if hasattr(experts, "gate_up_proj"):
+        return int(experts.gate_up_proj.shape[0])
+    if hasattr(experts, "num_experts"):
+        return int(experts.num_experts)
+    if hasattr(moe_block, "num_experts"):
+        return int(moe_block.num_experts)
+
+    router_attr = attrs.get("router", "gate")
+    if hasattr(moe_block, router_attr):
+        router = getattr(moe_block, router_attr)
+        router_weight_attr = attrs.get("router_weight_attr")
+        if router_weight_attr:
+            inner: Any = router
+            for part in router_weight_attr.split("."):
+                inner = getattr(inner, part)
+            if isinstance(inner, torch.Tensor):
+                return int(inner.shape[0])
+        elif hasattr(router, "weight"):
+            return int(router.weight.shape[0])
+
+    raise ValueError(f"Cannot determine number of experts from {moe_block.__class__.__name__}")
 
 
 def prune_layer(
@@ -63,7 +111,7 @@ def prune_layer(
         raise ValueError(f"Model {model_class} not registered in MODEL_ATTRS")
 
     moe_block = get_moe_block(model, layer_idx)
-    num_experts = get_num_experts(model, layer_idx)
+    num_experts = _get_num_experts_from_moe_block(moe_block, attrs)
 
     # Get retained expert indices
     experts_to_prune_set = set(experts_to_prune.tolist())
@@ -83,9 +131,6 @@ def prune_layer(
         _prune_fused_experts(moe_block, retained_indices, attrs)
     else:
         _prune_separate_experts(moe_block, retained_indices, attrs)
-
-    # Update config
-    _update_model_config(model, len(retained_indices), attrs)
 
     return len(retained_indices)
 
@@ -163,21 +208,23 @@ def _prune_router(
             inner_module = getattr(inner_module, part)
 
         weight_attr = parts[-1]
-        idx_tensor = torch.as_tensor(
-            retained_indices, device=inner_module.weight.device
-        )
+        weight = getattr(inner_module, weight_attr)
+        idx_tensor = torch.as_tensor(retained_indices, device=weight.device)
 
-        # Update weight
-        setattr(
-            inner_module, weight_attr, getattr(inner_module, weight_attr)[idx_tensor]
-        )
+        # Update weight. Preserve Parameter registration when this is an nn.Linear.
+        if isinstance(weight, nn.Parameter):
+            weight.data = weight.data[idx_tensor]
+        else:
+            setattr(inner_module, weight_attr, weight[idx_tensor])
 
         # Update bias if present
         bias_attr = weight_attr.replace("weight", "bias")
         if hasattr(inner_module, bias_attr) and getattr(inner_module, bias_attr) is not None:
-            setattr(
-                inner_module, bias_attr, getattr(inner_module, bias_attr)[idx_tensor]
-            )
+            bias = getattr(inner_module, bias_attr)
+            if isinstance(bias, nn.Parameter):
+                bias.data = bias.data[idx_tensor]
+            else:
+                setattr(inner_module, bias_attr, bias[idx_tensor])
 
         # Update out_features
         if hasattr(inner_module, "out_features"):
@@ -312,12 +359,26 @@ def compute_experts_to_prune(
                 )
                 saliency = layer_data.get("expert_frequency", expert_frequency)
 
-            # Prune experts with lowest saliency
+            # Prune experts with lowest saliency. Infinite saliency is used to
+            # mark preserved/super experts, so never select those unless there
+            # are literally no finite candidates left.
             if isinstance(saliency, torch.Tensor):
-                _, pruned = torch.topk(saliency, n_prune, largest=False)
+                saliency_for_pruning = saliency.clone()
+                finite_candidates = torch.isfinite(saliency_for_pruning)
+                n_prune = min(n_prune, int(finite_candidates.sum().item()))
+                if n_prune == 0:
+                    experts_to_prune[layer_idx] = torch.tensor([], dtype=torch.long)
+                    continue
+                saliency_for_pruning[~finite_candidates] = float("inf")
+                _, pruned = torch.topk(saliency_for_pruning, n_prune, largest=False)
             else:
+                finite_items = [
+                    (i, value) for i, value in enumerate(saliency)
+                    if math.isfinite(float(value))
+                ]
+                n_prune = min(n_prune, len(finite_items))
                 pruned = torch.tensor(
-                    sorted(range(len(saliency)), key=lambda i: saliency[i])[:n_prune],
+                    [i for i, _ in sorted(finite_items, key=lambda item: item[1])[:n_prune]],
                     dtype=torch.long,
                 )
 
@@ -365,8 +426,12 @@ def prune_model(
     ):
         if len(pruned_indices) == 0:
             # No pruning for this layer
-            num_experts = get_num_experts(model, layer_idx)
-            retained_counts[layer_idx] = num_experts
+            model_class = model.__class__.__name__
+            attrs = get_model_attrs(model_class)
+            if attrs is None:
+                raise ValueError(f"Model {model_class} not registered in MODEL_ATTRS")
+            moe_block = get_moe_block(model, layer_idx)
+            retained_counts[layer_idx] = _get_num_experts_from_moe_block(moe_block, attrs)
             continue
 
         retained = prune_layer(model, layer_idx, pruned_indices)
@@ -383,6 +448,23 @@ def prune_model(
         f"Pruning complete: {original_avg:.1f} -> {pruned_avg:.1f} "
         f"experts per layer ({compression:.1f}% compression)"
     )
+
+    # Update model.config once, after every layer has been physically pruned.
+    # Updating inside prune_layer corrupts later layers because get_num_experts()
+    # reads the global config before inspecting the actual layer module.
+    if retained_counts:
+        model_class = model.__class__.__name__
+        attrs = get_model_attrs(model_class)
+        if attrs is not None:
+            unique_counts = set(retained_counts.values())
+            final_expert_count = next(iter(retained_counts.values()))
+            if len(unique_counts) == 1:
+                _update_model_config(model, final_expert_count, attrs)
+            else:
+                logger.warning(
+                    f"Layers have different retained expert counts after pruning: {unique_counts}. "
+                    "Skipping scalar model.config expert-count update."
+                )
 
     return retained_counts
 
@@ -403,43 +485,33 @@ def _get_super_expert_indices(
     Returns:
         Tensor of [layer_idx, expert_idx] pairs
     """
-    max_activations = []
+    flat_scores = []
+    index_pairs: List[tuple[int, int]] = []
 
     for layer_idx, layer_data in observer_data.items():
         if "max_activations" in layer_data:
-            max_activations.append(
-                (layer_data["max_activations"].unsqueeze(0), layer_idx)
-            )
+            max_per_expert = layer_data["max_activations"].flatten()
         elif "expert_outputs" in layer_data:
             # Compute from expert outputs
             expert_outputs = layer_data["expert_outputs"]  # [num_experts, tokens, hidden]
-            max_per_expert = expert_outputs.abs().max(dim=(1, 2)).values
-            max_activations.append((max_per_expert, layer_idx))
+            max_per_expert = expert_outputs.abs().amax(dim=(1, 2))
+        else:
+            continue
 
-    if not max_activations:
+        flat_scores.append(max_per_expert.float())
+        index_pairs.extend((layer_idx, expert_idx) for expert_idx in range(max_per_expert.numel()))
+
+    if not flat_scores:
         return torch.empty(0, 2, dtype=torch.long)
 
-    # Flatten all activations
-    all_max = torch.cat([m[0] for m in max_activations])
-    layer_indices = []
-
-    idx = 0
-    for max_act, layer_idx in max_activations:
-        layer_indices.extend([layer_idx] * len(max_act))
-        idx += len(max_act)
-
+    all_max = torch.cat(flat_scores)
     threshold = torch.quantile(all_max, quantile / 100)
 
-    # Find experts above threshold
-    above_threshold = all_max > threshold
-    super_indices = torch.nonzero(above_threshold).squeeze(-1)
+    selected = torch.nonzero(all_max > threshold, as_tuple=False).flatten().tolist()
+    if not selected:
+        return torch.empty(0, 2, dtype=torch.long)
 
-    result = torch.stack([
-        torch.tensor([layer_indices[i] for i in super_indices]),
-        torch.tensor([i % max_activations[0][0].shape[0] for i in super_indices]),
-    ], dim=1)
-
-    return result
+    return torch.tensor([index_pairs[i] for i in selected], dtype=torch.long)
 
 
 def _mark_super_experts_preserved(
@@ -463,5 +535,6 @@ def _mark_super_experts_preserved(
                             observer_data[layer][key] = data.clone()
                             observer_data[layer][key][expert] = float("inf")
                         else:
-                            # For list data, we'll handle in compute_experts_to_prune
-                            pass
+                            data = list(data)
+                            data[expert] = float("inf")
+                            observer_data[layer][key] = data
