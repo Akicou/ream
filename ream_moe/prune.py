@@ -126,8 +126,12 @@ def prune_layer(
         f"retaining {len(retained_indices)}"
     )
 
-    # Prune based on whether experts are fused or separate
-    if attrs.get("fused", False):
+    # Prune based on whether experts are fused or separate. Detect fused
+    # tensors from the loaded module as well as MODEL_ATTRS to support models
+    # with multiple published checkpoint layouts.
+    experts_attr = attrs.get("experts", "experts")
+    experts_obj = getattr(moe_block, experts_attr)
+    if attrs.get("fused", False) or hasattr(experts_obj, "gate_up_proj"):
         _prune_fused_experts(moe_block, retained_indices, attrs)
     else:
         _prune_separate_experts(moe_block, retained_indices, attrs)
@@ -248,6 +252,20 @@ def _prune_router(
 
         if hasattr(router, "num_experts"):  # transformers >= 4.54+
             router.num_experts = len(retained_indices)
+
+    # Remap DeepSeek-V4 hash router token-id -> expert-id tables.
+    # Pruned expert ids are mapped to the first retained expert so indices stay
+    # in range; retained ids are remapped to their new compact positions.
+    if hasattr(router, "tid2eid"):
+        old_num_experts = max(
+            int(router.tid2eid.max().item()) + 1,
+            max(retained_indices) + 1 if retained_indices else 0,
+        )
+        mapping = torch.zeros(old_num_experts, device=router.tid2eid.device, dtype=router.tid2eid.dtype)
+        for new_idx, old_idx in enumerate(retained_indices):
+            if old_idx < mapping.numel():
+                mapping[old_idx] = new_idx
+        router.tid2eid.data = mapping[router.tid2eid.clamp(max=mapping.numel() - 1)]
 
     # Handle e_score_correction_bias if present
     if hasattr(router, "e_score_correction_bias"):

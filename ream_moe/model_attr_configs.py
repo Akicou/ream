@@ -107,6 +107,23 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts_per_tok": "num_experts_per_tok",
     },
 
+    # DeepSeek V4 Flash/Base MoE
+    # Extracted from DeepSeek-V4-Flash-Base safetensors/index headers:
+    # layers.N.ffn.experts.[0-255].w{1,2,3}, ffn.gate.weight, and
+    # ffn.gate.tid2eid for the first hash-routed layers. Some future
+    # Transformers loaders expose the block as `mlp`, so both paths are listed.
+    "DeepseekV4ForCausalLM": {
+        "moe_block": ["ffn", "mlp"],
+        "gate_proj": "w1",
+        "up_proj": "w3",
+        "down_proj": "w2",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "gate.top_k",
+    },
+
     # Kimi-K2-Thinking - DeepSeek V3 based architecture
     "KimiK2ForCausalLM": {
         "moe_block": "mlp",

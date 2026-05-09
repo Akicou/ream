@@ -44,6 +44,8 @@ class LayerObserverState:
 
     router_logits: List[torch.Tensor] = field(default_factory=list)
     expert_outputs: List[torch.Tensor] = field(default_factory=list)
+    selected_experts: List[torch.Tensor] = field(default_factory=list)
+    routing_weights: List[torch.Tensor] = field(default_factory=list)
     expert_frequency: Optional[torch.Tensor] = None
     saliency_scores: Optional[torch.Tensor] = None
 
@@ -68,15 +70,25 @@ class LayerObserverState:
             # expert_outputs is a list of tensors, each with shape [num_experts, num_tokens, hidden_dim]
             self.expert_outputs = torch.cat(self.expert_outputs, dim=1).to(storage_device)
 
-        # Compute final statistics (keep on storage device)
-        if self.router_logits is not None:
-            num_experts = self.router_logits.shape[-1]
-            probs = torch.softmax(self.router_logits, dim=-1)
+        if self.selected_experts:
+            self.selected_experts = torch.cat(self.selected_experts, dim=0).to(storage_device)
 
-            # Use the actual model top_k so frequency counts only routed tokens
-            actual_top_k = top_k if top_k is not None else num_experts
-            actual_top_k = min(actual_top_k, num_experts)
-            _, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
+        if self.routing_weights:
+            self.routing_weights = torch.cat(self.routing_weights, dim=0).to(storage_device)
+
+        # Compute final statistics (keep on storage device)
+        if isinstance(self.router_logits, torch.Tensor):
+            num_experts = self.router_logits.shape[-1]
+
+            if isinstance(self.selected_experts, torch.Tensor):
+                topk_idx = self.selected_experts
+            else:
+                probs = torch.softmax(self.router_logits, dim=-1)
+
+                # Use the actual model top_k so frequency counts only routed tokens
+                actual_top_k = top_k if top_k is not None else num_experts
+                actual_top_k = min(actual_top_k, num_experts)
+                _, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
             # Count expert activations
             flat_idx = topk_idx.view(-1)
@@ -155,13 +167,22 @@ class MoEObserver:
             except Exception:
                 self.layer_top_k[layer_idx] = 1  # safe conservative fallback
 
-            # Create hook function for this layer
+            # Create hook function for this layer. Use with_kwargs when
+            # available so DeepSeek-V4 hash MoE can read input_ids.
             def make_hook(idx: int):
-                def hook(module, args, output):
-                    return self._forward_hook(idx, module, args, output)
+                def hook(module, args, kwargs, output):
+                    return self._forward_hook(idx, module, args, output, kwargs)
                 return hook
 
-            handle = moe_block.register_forward_hook(make_hook(layer_idx))
+            try:
+                handle = moe_block.register_forward_hook(make_hook(layer_idx), with_kwargs=True)
+            except TypeError:
+                def make_legacy_hook(idx: int):
+                    def hook(module, args, output):
+                        return self._forward_hook(idx, module, args, output)
+                    return hook
+
+                handle = moe_block.register_forward_hook(make_legacy_hook(layer_idx))
             self.hooks.append(handle)
 
         logger.info(
@@ -182,6 +203,7 @@ class MoEObserver:
         module: nn.Module,
         args: tuple,
         output: Any,
+        kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """
         Forward hook for collecting statistics from a single MoE layer.
@@ -219,13 +241,12 @@ class MoEObserver:
             module, output, flat_input, num_experts
         )  # [num_tokens, num_experts]
 
-        # Get selected experts
-        probs = torch.softmax(router_logits, dim=-1)
-        if self.config.renormalize_router_weights:
-            topk_vals, topk_idx = torch.topk(probs, k=top_k, dim=-1)
-            probs = probs / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        _, selected_experts = torch.topk(probs, k=top_k, dim=-1)  # [num_tokens, top_k]
+        # Get selected experts and routing weights. DeepSeek-V4 hash MoE layers
+        # route via gate.tid2eid[input_ids] rather than top-k router logits, so
+        # preserve the actual selected experts when input_ids are available.
+        selected_experts, routing_weights = self._extract_selected_experts_and_weights(
+            module, args, router_logits, top_k, kwargs
+        )
 
         # Limit tokens to collect
         remaining_tokens = self.config.max_tokens_per_layer - tokens_collected
@@ -235,15 +256,19 @@ class MoEObserver:
             flat_input = flat_input[indices]
             router_logits = router_logits[indices]
             selected_experts = selected_experts[indices]
+            routing_weights = routing_weights[indices]
             num_tokens = remaining_tokens
 
-        # Collect router logits
+        # Collect router logits and actual routing choices
         state.router_logits.append(router_logits.cpu())
+        state.selected_experts.append(selected_experts.cpu())
+        state.routing_weights.append(routing_weights.cpu())
 
         # Compute expert outputs
         expert_outputs_list = []
 
-        if self.model_attrs.get("fused", False):
+        experts_obj = getattr(module, self.model_attrs.get("experts", "experts"), None)
+        if self.model_attrs.get("fused", False) or hasattr(experts_obj, "gate_up_proj"):
             # Fused experts - compute all at once
             expert_outputs = self._compute_fused_expert_outputs(
                 module, flat_input, num_experts
@@ -257,6 +282,76 @@ class MoEObserver:
         expert_outputs_list.append(expert_outputs.cpu())
 
         state.expert_outputs.extend(expert_outputs_list)
+
+    def _extract_selected_experts_and_weights(
+        self,
+        module: nn.Module,
+        args: tuple,
+        router_logits: torch.Tensor,
+        top_k: int,
+        kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract actual routed experts and their routing weights.
+
+        Most MoE models select top-k experts from router probabilities. DeepSeek-V4
+        hash layers are different: the first layers select experts from a
+        persistent token-id -> expert-id table (`gate.tid2eid`) and only use the
+        learned gate scores to weight those selected experts.
+        """
+        router_attr = self.model_attrs.get("router", "gate")
+        router = getattr(module, router_attr, None)
+
+        input_ids = None
+        if len(args) > 1 and args[1] is not None:
+            input_ids = args[1]
+        elif kwargs is not None:
+            input_ids = kwargs.get("input_ids")
+
+        if router is not None and hasattr(router, "tid2eid") and input_ids is not None:
+            input_ids = input_ids.reshape(-1).to(router.tid2eid.device)
+            selected_experts = router.tid2eid[input_ids].to(router_logits.device).long()
+
+            if hasattr(router, "score_fn"):
+                scores = router.score_fn(router_logits.float())
+            else:
+                scores = torch.softmax(router_logits, dim=-1)
+
+            routing_weights = torch.gather(scores, dim=-1, index=selected_experts)
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+
+            if hasattr(router, "routed_scaling_factor"):
+                routing_weights = routing_weights * router.routed_scaling_factor
+
+            return selected_experts, routing_weights.to(router_logits.dtype)
+
+        # DeepSeek-style top-k routers use a non-softmax score function and
+        # normalize only the selected expert weights.
+        if router is not None and hasattr(router, "score_fn"):
+            scores = router.score_fn(router_logits.float())
+            selection_scores = scores
+            correction_bias = getattr(router, "e_score_correction_bias", None)
+            if correction_bias is None:
+                correction_bias = getattr(router, "bias", None)
+            if correction_bias is not None:
+                selection_scores = selection_scores + correction_bias.to(selection_scores.device)
+
+            selected_experts = torch.topk(selection_scores, k=top_k, dim=-1, sorted=False).indices
+            topk_vals = torch.gather(scores, dim=-1, index=selected_experts)
+            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+
+            if hasattr(router, "routed_scaling_factor"):
+                topk_vals = topk_vals * router.routed_scaling_factor
+
+            return selected_experts, topk_vals.to(router_logits.dtype)
+
+        probs = torch.softmax(router_logits, dim=-1)
+        topk_vals, selected_experts = torch.topk(probs, k=top_k, dim=-1)
+
+        if self.config.renormalize_router_weights:
+            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        return selected_experts, topk_vals
 
     def _extract_router_logits(
         self,
@@ -312,8 +407,10 @@ class MoEObserver:
                     device=flat_input.device, dtype=flat_input.dtype
                 )
 
-            # Compute logits
-            logits = F.linear(flat_input.to(weight.dtype), weight, bias)
+            # Compute logits. DeepSeek-style routers use `bias` as a correction
+            # term after the score function, not as a linear bias.
+            linear_bias = None if (hasattr(router, "score_fn") or hasattr(router, "tid2eid")) else bias
+            logits = F.linear(flat_input.to(weight.dtype), weight, linear_bias)
             return logits
 
         # Fallback: create placeholder
@@ -392,8 +489,8 @@ class MoEObserver:
 
             # Compute saliency scores
             if (
-                state.router_logits is not None
-                and state.expert_outputs is not None
+                isinstance(state.router_logits, torch.Tensor)
+                and isinstance(state.expert_outputs, torch.Tensor)
                 and state.saliency_scores is None
             ):
                 state.saliency_scores = self._compute_saliency(
@@ -401,6 +498,8 @@ class MoEObserver:
                     state.expert_outputs,
                     top_k=top_k,
                     renormalize_topk=self.config.renormalize_router_weights,
+                    selected_experts=state.selected_experts if isinstance(state.selected_experts, torch.Tensor) else None,
+                    routing_weights=state.routing_weights if isinstance(state.routing_weights, torch.Tensor) else None,
                 )
 
         # Convert to output format
@@ -411,6 +510,8 @@ class MoEObserver:
                 "expert_outputs": state.expert_outputs,
                 "expert_frequency": state.expert_frequency,
                 "saliency_scores": state.saliency_scores,
+                "selected_experts": state.selected_experts if isinstance(state.selected_experts, torch.Tensor) else None,
+                "routing_weights": state.routing_weights if isinstance(state.routing_weights, torch.Tensor) else None,
             }
 
         return result
@@ -421,6 +522,8 @@ class MoEObserver:
         expert_outputs: torch.Tensor,  # [num_experts, num_tokens, hidden_dim]
         top_k: Optional[int] = None,
         renormalize_topk: bool = False,
+        selected_experts: Optional[torch.Tensor] = None,
+        routing_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute REAP saliency scores per expert.
@@ -436,19 +539,30 @@ class MoEObserver:
             renormalize_topk: Whether to renormalize top-k router probabilities
                    before weighting expert-output norms, matching Mixtral/Qwen-style
                    routing implementations that normalize selected expert weights.
+            selected_experts: Optional actual selected experts [num_tokens, top_k].
+                   Used by hash-routing models like DeepSeek-V4.
+            routing_weights: Optional actual routing weights [num_tokens, top_k].
 
         Returns:
             Saliency scores [num_experts]
         """
         num_tokens, num_experts = router_logits.shape
-        probs = torch.softmax(router_logits, dim=-1)  # [num_tokens, num_experts]
+        if selected_experts is not None:
+            topk_idx = selected_experts.to(router_logits.device)
+            if routing_weights is not None:
+                topk_vals = routing_weights.to(router_logits.device)
+            else:
+                probs = torch.softmax(router_logits, dim=-1)
+                topk_vals = torch.gather(probs, dim=-1, index=topk_idx)
+        else:
+            probs = torch.softmax(router_logits, dim=-1)  # [num_tokens, num_experts]
 
-        # Use the model's actual top-k so only routed tokens count toward saliency
-        actual_top_k = top_k if top_k is not None else num_experts
-        actual_top_k = min(actual_top_k, num_experts)
-        topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
-        if renormalize_topk:
-            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # Use the model's actual top-k so only routed tokens count toward saliency
+            actual_top_k = top_k if top_k is not None else num_experts
+            actual_top_k = min(actual_top_k, num_experts)
+            topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
+            if renormalize_topk:
+                topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         saliency = torch.zeros(num_experts, device=router_logits.device)
 
@@ -514,6 +628,22 @@ def _get_top_k_from_module(module: nn.Module, model_attrs: Dict[str, Any]) -> in
         return reduce(getattr, top_k_attr.split("."), module)
     except AttributeError:
         pass
+
+    # Fallback: common names on the block and its router.
+    for attr_name in ["top_k", "topk", "num_experts_per_tok", "k", "num_selected_experts"]:
+        if hasattr(module, attr_name):
+            val = getattr(module, attr_name)
+            if isinstance(val, int):
+                return val
+
+    router_attr = model_attrs.get("router", "gate")
+    if hasattr(module, router_attr):
+        router = getattr(module, router_attr)
+        for attr_name in ["top_k", "topk", "num_experts_per_tok", "k", "num_selected_experts"]:
+            if hasattr(router, attr_name):
+                val = getattr(router, attr_name)
+                if isinstance(val, int):
+                    return val
 
     # Default fallback
     return 1

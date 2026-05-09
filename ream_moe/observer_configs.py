@@ -103,6 +103,17 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
         },
     ),
 
+    # DeepSeek V4 Flash/Base
+    "DeepseekV4ForCausalLM": type(
+        "DeepSeekV4MoEObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "DeepseekV4SparseMoeBlock|MoE",
+            "num_experts_attr_name": "n_routed_experts",
+            "top_k_attr_name": "gate.top_k",
+        },
+    ),
+
     # Kimi-K2-Thinking - DeepSeek V3 based
     "KimiK2ForCausalLM": type(
         "KimiK2MoEObserverConfig",

@@ -20,7 +20,7 @@
   - Qwen (Qwen3Moe, NonUniformQwen3Moe)
   - Llama4 (Llama4ForCausalLM)
   - Mixtral (MixtralForCausalLM)
-  - DeepSeek (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM)
+  - DeepSeek (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV4ForCausalLM)
   - Kimi (KimiK2ForCausalLM)
   - GLM (Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM, GlmMoeDsaForCausalLM)
   - Ernie (Ernie4_5_MoEForCausalLM, Ernie4_5_MoeForCausalLM)
@@ -127,6 +127,7 @@ retained_counts = merge_model(model, observer_data, config)
 | Mixtral | `MixtralForCausalLM` | No | Uses w1/w2/w3 naming |
 | DeepSeek V2 | `DeepseekV2ForCausalLM` | No | 160 experts, top_k=6 |
 | DeepSeek V3 | `DeepseekV3ForCausalLM` | No | 256 experts, MLA attention |
+| DeepSeek V4 Flash/Base | `DeepseekV4ForCausalLM` | Auto | 256 experts, top_k=6, hash-routed first layers |
 | Kimi K2 | `KimiK2ForCausalLM` | No | DeepSeek V3 based |
 | GLM-4 | `Glm4MoeForCausalLM` | No | 64 routed experts |
 | GLM-4.7 Flash | `Glm4MoeLiteForCausalLM` | Yes | Layer 0 dense, 1-46 MoE |

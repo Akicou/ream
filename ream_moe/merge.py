@@ -151,12 +151,25 @@ def _compute_saliency_scores(
         if isinstance(precomputed, torch.Tensor) and precomputed.shape[0] == num_experts:
             return precomputed
 
-    # Compute REAP saliency from scratch using the correct routing top-k
+    # Compute REAP saliency from scratch using the correct routed experts.
+    # If the observer captured actual selections (e.g. DeepSeek-V4 hash MoE),
+    # use them; otherwise derive top-k from router probabilities.
     T, N = router_logits.shape
-    probs = torch.softmax(router_logits, dim=-1)
-    actual_top_k = top_k if top_k is not None else N
-    actual_top_k = min(actual_top_k, N)
-    topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
+    selected_experts = observer_stats.get("selected_experts")
+    routing_weights = observer_stats.get("routing_weights")
+
+    if isinstance(selected_experts, torch.Tensor):
+        topk_idx = selected_experts.to(router_logits.device)
+        if isinstance(routing_weights, torch.Tensor):
+            topk_vals = routing_weights.to(router_logits.device)
+        else:
+            probs = torch.softmax(router_logits, dim=-1)
+            topk_vals = torch.gather(probs, dim=-1, index=topk_idx)
+    else:
+        probs = torch.softmax(router_logits, dim=-1)
+        actual_top_k = top_k if top_k is not None else N
+        actual_top_k = min(actual_top_k, N)
+        topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
     # Memory-efficient vectorized approach: iterate but with batched operations
     saliency = torch.zeros(N, device=router_logits.device)
@@ -451,7 +464,7 @@ def _get_expert_weights(
         except NotImplementedError:
             return t.data.to("cpu")
 
-    if attrs.get("fused", False):
+    if attrs.get("fused", False) or hasattr(experts, "gate_up_proj"):
         gate_up = safe_cpu(experts.gate_up_proj)  # [E, 2I, H]
         down    = safe_cpu(experts.down_proj)      # [E, H, I]
 
@@ -509,7 +522,7 @@ def _update_merged_weights(
     experts = moe_block.experts
     num_retained = len(groups)
 
-    if attrs.get("fused", False):
+    if attrs.get("fused", False) or hasattr(experts, "gate_up_proj"):
         # gate_up_proj: [E, 2I, H],  down_proj: [E, H, I]
         H           = experts.gate_up_proj.shape[2]
         target_dev  = experts.gate_up_proj.device
@@ -653,6 +666,19 @@ def _update_router_for_merge(
 
         if hasattr(router, "num_experts"):
             router.num_experts = len(groups)
+
+    # Remap DeepSeek-V4 hash router token-id -> expert-id tables from old
+    # expert ids to new merged group ids.
+    if hasattr(router, "tid2eid"):
+        old_num_experts = max(max(g) for g in groups) + 1
+        if hasattr(router, "num_experts"):
+            old_num_experts = max(old_num_experts, int(router.num_experts))
+        mapping = torch.zeros(old_num_experts, device=router.tid2eid.device, dtype=router.tid2eid.dtype)
+        for group_idx, group in enumerate(groups):
+            for old_idx in group:
+                if old_idx < mapping.numel():
+                    mapping[old_idx] = group_idx
+        router.tid2eid.data = mapping[router.tid2eid.clamp(max=mapping.numel() - 1)]
 
     # Handle router-side correction biases if present.
     if hasattr(router, "e_score_correction_bias"):

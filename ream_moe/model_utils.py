@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from functools import reduce
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,17 @@ import torch.nn as nn
 from ream_moe.model_attr_configs import MODEL_ATTRS, get_model_attrs
 
 logger = logging.getLogger(__name__)
+
+
+def _as_attr_paths(value: Any, default: str = "mlp") -> List[str]:
+    """Normalize a model-attribute path or list of paths to a list."""
+    if value is None:
+        return [default]
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Iterable):
+        return [str(v) for v in value]
+    return [str(value)]
 
 
 def get_moe_block(model: nn.Module, layer_idx: int) -> nn.Module:
@@ -46,7 +57,7 @@ def get_moe_block(model: nn.Module, layer_idx: int) -> nn.Module:
             f"Supported classes: {sorted(MODEL_ATTRS.keys())}"
         )
 
-    moe_attr_name = attrs.get("moe_block", "mlp")
+    moe_attr_paths = _as_attr_paths(attrs.get("moe_block", "mlp"))
 
     # Navigate to the layer's MoE block
     layers = None
@@ -64,10 +75,18 @@ def get_moe_block(model: nn.Module, layer_idx: int) -> nn.Module:
 
     layer = layers[layer_idx]
 
-    # Handle nested attributes (e.g., "block_sparse_moe")
-    moe_block = reduce(getattr, moe_attr_name.split("."), layer)
+    # Handle nested attributes (e.g., "block_sparse_moe") and models with
+    # multiple known aliases for the MoE block (e.g., DeepSeek-V4 ffn vs mlp).
+    for moe_attr_name in moe_attr_paths:
+        try:
+            return reduce(getattr, moe_attr_name.split("."), layer)
+        except AttributeError:
+            continue
 
-    return moe_block
+    raise ValueError(
+        f"Cannot find MoE block path(s) {moe_attr_paths} in layer {layer_idx} "
+        f"for model {model_class}"
+    )
 
 
 def get_num_experts(model: nn.Module, layer_idx: int = 0) -> int:
@@ -169,12 +188,21 @@ def get_top_k(model: nn.Module, layer_idx: int = 0) -> int:
     except AttributeError:
         pass
 
-    # Fallback: try common patterns
-    for attr_name in ["top_k", "num_experts_per_tok", "k", "num_selected_experts"]:
+    # Fallback: try common patterns on the MoE block and its router.
+    for attr_name in ["top_k", "topk", "num_experts_per_tok", "k", "num_selected_experts"]:
         if hasattr(moe_block, attr_name):
             val = getattr(moe_block, attr_name)
             if isinstance(val, int):
                 return val
+
+    router_attr = attrs.get("router", "gate")
+    if hasattr(moe_block, router_attr):
+        router = getattr(moe_block, router_attr)
+        for attr_name in ["top_k", "topk", "num_experts_per_tok", "k", "num_selected_experts"]:
+            if hasattr(router, attr_name):
+                val = getattr(router, attr_name)
+                if isinstance(val, int):
+                    return val
 
     raise ValueError(f"Cannot determine top_k for model {model_class} at layer {layer_idx}")
 
@@ -203,27 +231,31 @@ def list_moe_layers(model: nn.Module) -> List[int]:
     model_class = model.__class__.__name__
     attrs = get_model_attrs(model_class)
 
-    moe_attr_name = attrs.get("moe_block", "mlp") if attrs else "mlp"
+    moe_attr_paths = _as_attr_paths(attrs.get("moe_block", "mlp") if attrs else "mlp")
 
     for idx, layer in enumerate(layers):
-        if moe_attr_name in ["mlp"] and hasattr(layer, "mlp"):
-            moe_block = layer.mlp
-        elif moe_attr_name in ["block_sparse_moe"] and hasattr(layer, "block_sparse_moe"):
-            moe_block = layer.block_sparse_moe
-        elif moe_attr_name in ["feed_forward"] and hasattr(layer, "feed_forward"):
-            moe_block = layer.feed_forward
-        elif moe_attr_name in ["moe"] and hasattr(layer, "moe"):
-            moe_block = layer.moe
-        else:
-            # Try nested access
-            try:
-                moe_block = reduce(getattr, moe_attr_name.split("."), layer)
-            except AttributeError:
-                continue
+        for moe_attr_name in moe_attr_paths:
+            if moe_attr_name in ["mlp"] and hasattr(layer, "mlp"):
+                moe_block = layer.mlp
+            elif moe_attr_name in ["block_sparse_moe"] and hasattr(layer, "block_sparse_moe"):
+                moe_block = layer.block_sparse_moe
+            elif moe_attr_name in ["feed_forward"] and hasattr(layer, "feed_forward"):
+                moe_block = layer.feed_forward
+            elif moe_attr_name in ["moe"] and hasattr(layer, "moe"):
+                moe_block = layer.moe
+            elif moe_attr_name in ["ffn"] and hasattr(layer, "ffn"):
+                moe_block = layer.ffn
+            else:
+                # Try nested access
+                try:
+                    moe_block = reduce(getattr, moe_attr_name.split("."), layer)
+                except AttributeError:
+                    continue
 
-        # Check if this is actually an MoE block
-        if hasattr(moe_block, "experts"):
-            moe_layers.append(idx)
+            # Check if this is actually an MoE block
+            if hasattr(moe_block, "experts"):
+                moe_layers.append(idx)
+                break
 
     return moe_layers
 
@@ -301,12 +333,23 @@ def _infer_model_attrs(model: nn.Module) -> Dict[str, Any]:
                     for router_name in ["gate", "router", "gating"]:
                         if hasattr(moe, router_name):
                             attrs["router"] = router_name
-                            # Check if router uses classifier pattern (like LongCat)
                             router_module = getattr(moe, router_name)
+
+                            # Check if router uses classifier pattern (like LongCat)
                             if hasattr(router_module, "classifier") and isinstance(
                                 router_module.classifier, nn.Linear
                             ):
                                 attrs["router_weight_attr"] = "classifier.weight"
+
+                            # Infer nested top-k / expert-count attributes from router modules.
+                            for topk_name in ["top_k", "topk", "num_experts_per_tok", "k"]:
+                                if hasattr(router_module, topk_name):
+                                    attrs["num_experts_per_tok"] = f"{router_name}.{topk_name}"
+                                    break
+                            for n_name in ["num_experts", "n_routed_experts", "num_local_experts"]:
+                                if hasattr(router_module, n_name):
+                                    attrs["num_experts"] = f"{router_name}.{n_name}"
+                                    break
                             break
 
                     break
@@ -478,8 +521,8 @@ def _verify_model_structure(
     if layers is None or len(layers) == 0:
         return ["Could not find any decoder layers in the model"]
 
-    moe_block_path = model_attrs.get("moe_block")
-    if not moe_block_path:
+    moe_block_paths = _as_attr_paths(model_attrs.get("moe_block"))
+    if not moe_block_paths:
         return ["MODEL_ATTRS missing 'moe_block' path"]
 
     # Find the first layer that actually has MoE (not just layer 0)
@@ -489,37 +532,40 @@ def _verify_model_structure(
     moe_layer_idx = -1
 
     for idx, candidate_layer in enumerate(layers):
-        # Navigate to MoE block
-        current = candidate_layer
-        block = None
-        for attr in moe_block_path.split("."):
-            if hasattr(current, attr):
-                block = getattr(current, attr)
-                current = block
-            else:
-                block = None
-                break
-
-        if block is not None:
-            # Check if this block actually has MoE (experts attribute)
-            experts_path = model_attrs.get("experts", "")
-            if experts_path:
-                parts = experts_path.split(".")
-                current = block
-                for i, part in enumerate(parts[:-1]) if len(parts) > 1 else []:
-                    if hasattr(current, part):
-                        current = getattr(current, part)
-                    else:
-                        current = None
-                        break
-
-                if current is not None and hasattr(current, parts[-1]):
-                    # Found an MoE layer!
-                    layer = candidate_layer
-                    moe_block = block
-                    moe_layer_idx = idx
-                    logger.info(f"✅ Found MoE layer at index {idx}")
+        for moe_block_path in moe_block_paths:
+            # Navigate to MoE block
+            current = candidate_layer
+            block = None
+            for attr in moe_block_path.split("."):
+                if hasattr(current, attr):
+                    block = getattr(current, attr)
+                    current = block
+                else:
+                    block = None
                     break
+
+            if block is not None:
+                # Check if this block actually has MoE (experts attribute)
+                experts_path = model_attrs.get("experts", "")
+                if experts_path:
+                    parts = experts_path.split(".")
+                    current = block
+                    for i, part in enumerate(parts[:-1]) if len(parts) > 1 else []:
+                        if hasattr(current, part):
+                            current = getattr(current, part)
+                        else:
+                            current = None
+                            break
+
+                    if current is not None and hasattr(current, parts[-1]):
+                        # Found an MoE layer!
+                        layer = candidate_layer
+                        moe_block = block
+                        moe_layer_idx = idx
+                        logger.info(f"✅ Found MoE layer at index {idx}")
+                        break
+        if moe_block is not None:
+            break
 
     if layer is None or moe_block is None:
         errors.append(f"Could not find any layer with MoE structure (checked {len(layers)} layers)")
@@ -542,8 +588,9 @@ def _verify_model_structure(
         if hasattr(current, parts[-1]):
             experts = getattr(current, parts[-1])
 
-            # Handle fused experts (Qwen3, Llama4, etc.)
-            if model_attrs.get("fused", False):
+            # Handle fused experts (Qwen3, Llama4, etc.). Also detect from
+            # the loaded module to support alternate checkpoint layouts.
+            if model_attrs.get("fused", False) or hasattr(experts, "gate_up_proj"):
                 # For fused experts, check for gate_up_proj tensor
                 if hasattr(experts, "gate_up_proj"):
                     num_experts = experts.gate_up_proj.shape[0]
