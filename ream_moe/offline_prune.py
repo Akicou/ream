@@ -14,6 +14,7 @@ Notes:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import random
@@ -110,13 +111,47 @@ def _model_class_from_config(config: Dict[str, Any]) -> str:
     raise ValueError("Could not infer model class from config.json architectures/model_type")
 
 
-def _get_config_int(config: Dict[str, Any], attr: str) -> Optional[int]:
+def _normalise_config_path(attr: str) -> List[str]:
+    """Return a config JSON path from a MODEL_ATTRS config/module path."""
+    if not attr:
+        return []
     if attr.startswith("config."):
         attr = attr.split(".", 1)[1]
-    if "." in attr:
-        return None
-    value = config.get(attr)
-    return int(value) if isinstance(value, int) else None
+    return [part for part in attr.split(".") if part]
+
+
+def _get_config_value(config: Dict[str, Any], attr: str) -> Any:
+    """Read a possibly nested value from a config JSON dict."""
+    parts = _normalise_config_path(attr)
+    current: Any = config
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _get_config_int(config: Dict[str, Any], attr: str) -> Optional[int]:
+    value = _get_config_value(config, attr)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _set_config_path_if_present(config: Dict[str, Any], attr: str, value: int) -> bool:
+    """Set an existing top-level or nested config key; never creates new paths."""
+    parts = _normalise_config_path(attr)
+    if not parts:
+        return False
+
+    current: Any = config
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+
+    if isinstance(current, dict) and parts[-1] in current:
+        current[parts[-1]] = value
+        return True
+    return False
 
 
 def _load_weight_map(model_dir: Path) -> Tuple[Dict[str, str], Optional[Dict[str, Any]]]:
@@ -137,25 +172,42 @@ def _load_weight_map(model_dir: Path) -> Tuple[Dict[str, str], Optional[Dict[str
     return weight_map, None
 
 
-def _infer_layers_and_experts(weight_map: Dict[str, str], moe_paths: List[str]) -> Tuple[List[int], int]:
+def _infer_layers_and_experts(
+    weight_map: Dict[str, str],
+    layer_prefixes: List[str],
+    moe_paths: List[str],
+    expert_paths: List[str],
+) -> Tuple[List[int], int]:
     layers: set[int] = set()
+    fused_layers: set[int] = set()
     experts: set[int] = set()
 
     for key in weight_map:
-        match = _match_numbered_expert_key(key, moe_paths)
-        if match is None:
+        numbered = _match_numbered_expert_key(key, layer_prefixes, moe_paths, expert_paths)
+        if numbered is not None:
+            _layer_prefix, layer_idx, _moe_path, _expert_path, expert_idx, _rest = numbered
+            layers.add(layer_idx)
+            experts.add(expert_idx)
             continue
-        _prefix, layer_idx, _moe_path, expert_idx, _rest = match
-        layers.add(layer_idx)
-        experts.add(expert_idx)
 
-    if not layers or not experts:
-        raise ValueError(
-            "Could not find numbered expert tensors in safetensors index. "
-            f"Checked MoE paths: {moe_paths}"
-        )
+        fused = _match_fused_experts_key(key, layer_prefixes, moe_paths, expert_paths)
+        if fused is not None:
+            _layer_prefix, layer_idx, _moe_path, _expert_path, _name = fused
+            fused_layers.add(layer_idx)
 
-    return sorted(layers), max(experts) + 1
+    if layers and experts:
+        return sorted(layers), max(experts) + 1
+
+    if fused_layers:
+        # Fused checkpoints do not number experts in parameter names.  The
+        # expert count must come from config.json; tensor slicing happens later.
+        return sorted(fused_layers), 0
+
+    raise ValueError(
+        "Could not find numbered or fused expert tensors in safetensors index. "
+        f"Checked layer prefixes: {layer_prefixes}, MoE paths: {moe_paths}, "
+        f"expert paths: {expert_paths}"
+    )
 
 
 def _build_retained_indices(
@@ -180,40 +232,76 @@ def _build_old_to_new(retained: List[int], num_experts: int) -> torch.Tensor:
     return mapping
 
 
+def _moe_regex_part(moe_path: str) -> str:
+    return rf"{re.escape(moe_path)}\." if moe_path else ""
+
+
+def _moe_key_part(moe_path: str) -> str:
+    return f"{moe_path}." if moe_path else ""
+
+
 def _match_numbered_expert_key(
     key: str,
+    layer_prefixes: List[str],
     moe_paths: List[str],
-) -> Optional[Tuple[str, int, str, int, str]]:
-    for moe_path in moe_paths:
-        pattern = rf"^((?:model\.)?)layers\.(\d+)\.{re.escape(moe_path)}\.experts\.(\d+)\.(.+)$"
-        match = re.match(pattern, key)
-        if match:
-            return match.group(1), int(match.group(2)), moe_path, int(match.group(3)), match.group(4)
+    expert_paths: List[str],
+) -> Optional[Tuple[str, int, str, str, int, str]]:
+    for layer_prefix in layer_prefixes:
+        for moe_path in moe_paths:
+            for expert_path in expert_paths:
+                pattern = (
+                    rf"^({re.escape(layer_prefix)})\.(\d+)\."
+                    rf"{_moe_regex_part(moe_path)}{re.escape(expert_path)}\."
+                    rf"(\d+)\.(.+)$"
+                )
+                match = re.match(pattern, key)
+                if match:
+                    return (
+                        match.group(1),
+                        int(match.group(2)),
+                        moe_path,
+                        expert_path,
+                        int(match.group(3)),
+                        match.group(4),
+                    )
     return None
 
 
 def _match_fused_experts_key(
     key: str,
+    layer_prefixes: List[str],
     moe_paths: List[str],
-) -> Optional[Tuple[str, int, str, str]]:
-    for moe_path in moe_paths:
-        pattern = rf"^((?:model\.)?)layers\.(\d+)\.{re.escape(moe_path)}\.experts\.(gate_up_proj|down_proj)(?:\.weight)?$"
-        match = re.match(pattern, key)
-        if match:
-            return match.group(1), int(match.group(2)), moe_path, match.group(3)
+    expert_paths: List[str],
+) -> Optional[Tuple[str, int, str, str, str]]:
+    for layer_prefix in layer_prefixes:
+        for moe_path in moe_paths:
+            for expert_path in expert_paths:
+                pattern = (
+                    rf"^({re.escape(layer_prefix)})\.(\d+)\."
+                    rf"{_moe_regex_part(moe_path)}{re.escape(expert_path)}\."
+                    rf"(gate_up_proj|down_proj)(?:\.weight)?$"
+                )
+                match = re.match(pattern, key)
+                if match:
+                    return match.group(1), int(match.group(2)), moe_path, expert_path, match.group(3)
     return None
 
 
 def _match_router_key(
     key: str,
+    layer_prefixes: List[str],
     moe_paths: List[str],
     router_attr: str,
 ) -> Optional[Tuple[str, int, str, str]]:
-    for moe_path in moe_paths:
-        pattern = rf"^((?:model\.)?)layers\.(\d+)\.{re.escape(moe_path)}\.{re.escape(router_attr)}\.(.+)$"
-        match = re.match(pattern, key)
-        if match:
-            return match.group(1), int(match.group(2)), moe_path, match.group(3)
+    for layer_prefix in layer_prefixes:
+        for moe_path in moe_paths:
+            pattern = (
+                rf"^({re.escape(layer_prefix)})\.(\d+)\."
+                rf"{_moe_regex_part(moe_path)}{re.escape(router_attr)}\.(.+)$"
+            )
+            match = re.match(pattern, key)
+            if match:
+                return match.group(1), int(match.group(2)), moe_path, match.group(3)
     return None
 
 
@@ -236,15 +324,59 @@ def _copy_non_weight_files(source_dir: Path, output_dir: Path, skip_safetensors:
 def _update_config(
     config: Dict[str, Any],
     retained_experts: int,
+    attrs: Dict[str, Any],
 ) -> Dict[str, Any]:
-    updated = dict(config)
-    for key in ["n_routed_experts", "num_experts", "num_local_experts", "moe_num_experts"]:
-        if key in updated:
-            updated[key] = retained_experts
+    """Return config.json updated to match physically pruned expert tensors."""
+    updated = copy.deepcopy(config)
 
-    for topk_key in ["num_experts_per_tok", "moe_k", "top_k", "num_selected_experts"]:
-        if isinstance(updated.get(topk_key), int) and updated[topk_key] > retained_experts:
-            updated[topk_key] = retained_experts
+    expert_count_paths = [
+        str(attrs.get("num_experts", "")),
+        "n_routed_experts",
+        "num_experts",
+        "num_local_experts",
+        "moe_num_experts",
+        "config.n_routed_experts",
+        "config.num_experts",
+        "config.num_local_experts",
+        "config.moe_num_experts",
+        "text_config.num_experts",
+    ]
+    for path in expert_count_paths:
+        _set_config_path_if_present(updated, path, retained_experts)
+
+    # Ernie-style capacity vectors encode routed expert count per stage.
+    if isinstance(updated.get("moe_capacity"), list):
+        updated["moe_capacity"] = [
+            retained_experts if isinstance(item, int) and not isinstance(item, bool) else item
+            for item in updated["moe_capacity"]
+        ]
+
+    topk_paths = [
+        str(attrs.get("num_experts_per_tok", "")),
+        "num_experts_per_tok",
+        "moe_k",
+        "moe_topk",
+        "top_k",
+        "topk",
+        "num_selected_experts",
+        "gate.top_k",
+        "gate.topk",
+        "router.top_k",
+        "router.topk",
+        "config.num_experts_per_tok",
+        "config.moe_k",
+        "config.moe_topk",
+        "config.top_k",
+        "config.topk",
+        "config.num_selected_experts",
+        "text_config.top_k_experts",
+        "text_config.num_experts_per_tok",
+        "text_config.top_k",
+    ]
+    for path in topk_paths:
+        value = _get_config_int(updated, path)
+        if value is not None and value > retained_experts:
+            _set_config_path_if_present(updated, path, retained_experts)
 
     return updated
 
@@ -257,31 +389,36 @@ def _transform_tensor(
     key: str,
     tensor: torch.Tensor,
     *,
+    layer_prefixes: List[str],
     moe_paths: List[str],
+    expert_paths: List[str],
     router_attr: str,
     num_experts: int,
     retained_by_layer: Dict[int, List[int]],
 ) -> Tuple[Optional[str], Optional[torch.Tensor]]:
-    numbered = _match_numbered_expert_key(key, moe_paths)
+    numbered = _match_numbered_expert_key(key, layer_prefixes, moe_paths, expert_paths)
     if numbered is not None:
-        prefix, layer_idx, moe_path, old_expert_idx, rest = numbered
+        layer_prefix, layer_idx, moe_path, expert_path, old_expert_idx, rest = numbered
         retained = retained_by_layer[layer_idx]
         if old_expert_idx not in retained:
             return None, None
         new_expert_idx = retained.index(old_expert_idx)
-        new_key = f"{prefix}layers.{layer_idx}.{moe_path}.experts.{new_expert_idx}.{rest}"
+        new_key = (
+            f"{layer_prefix}.{layer_idx}.{_moe_key_part(moe_path)}"
+            f"{expert_path}.{new_expert_idx}.{rest}"
+        )
         return new_key, tensor
 
-    fused = _match_fused_experts_key(key, moe_paths)
+    fused = _match_fused_experts_key(key, layer_prefixes, moe_paths, expert_paths)
     if fused is not None:
-        _prefix, layer_idx, _moe_path, _name = fused
+        _prefix, layer_idx, _moe_path, _expert_path, _name = fused
         retained = retained_by_layer[layer_idx]
         if tensor.ndim > 0 and tensor.shape[0] == num_experts:
             idx = torch.as_tensor(retained, dtype=torch.long)
             return key, tensor.index_select(0, idx)
         return key, tensor
 
-    router = _match_router_key(key, moe_paths, router_attr)
+    router = _match_router_key(key, layer_prefixes, moe_paths, router_attr)
     if router is not None:
         _prefix, layer_idx, _moe_path, router_leaf = router
         retained = retained_by_layer[layer_idx]
@@ -336,16 +473,41 @@ def offline_seed_prune_safetensors(
     if attrs is None:
         raise ValueError(f"Model class {model_class!r} is not registered in MODEL_ATTRS")
 
+    layer_prefixes = _as_list(attrs.get("layer_prefix", ["layers", "model.layers"]))
     moe_paths = _as_list(attrs.get("moe_block", "mlp"))
+    expert_paths = _as_list(attrs.get("experts", "experts"))
     router_attr = str(attrs.get("router", "gate"))
 
     weight_map, original_index = _load_weight_map(source_dir)
-    layers, inferred_num_experts = _infer_layers_and_experts(weight_map, moe_paths)
+    layers, inferred_num_experts = _infer_layers_and_experts(
+        weight_map,
+        layer_prefixes,
+        moe_paths,
+        expert_paths,
+    )
 
-    config_num_experts = _get_config_int(config, str(attrs.get("num_experts", "")))
+    config_num_experts = None
+    for expert_count_path in [
+        str(attrs.get("num_experts", "")),
+        "n_routed_experts",
+        "num_experts",
+        "num_local_experts",
+        "moe_num_experts",
+        "experts.num_experts",
+        "text_config.num_experts",
+    ]:
+        config_num_experts = _get_config_int(config, expert_count_path)
+        if config_num_experts is not None:
+            break
+
     num_experts = config_num_experts or inferred_num_experts
+    if not num_experts:
+        raise ValueError(
+            "Could not determine expert count from config.json or checkpoint keys. "
+            f"MODEL_ATTRS num_experts={attrs.get('num_experts')!r}"
+        )
 
-    if num_experts != inferred_num_experts:
+    if inferred_num_experts and num_experts != inferred_num_experts:
         logger.warning(
             "Config expert count (%s) differs from checkpoint inferred count (%s); using checkpoint count",
             num_experts,
@@ -376,7 +538,7 @@ def offline_seed_prune_safetensors(
 
     _copy_non_weight_files(source_dir, output_dir, skip_safetensors)
     (output_dir / "config.json").write_text(
-        json.dumps(_update_config(config, retained_experts), indent=2, sort_keys=False) + "\n",
+        json.dumps(_update_config(config, retained_experts, attrs), indent=2, sort_keys=False) + "\n",
         encoding="utf-8",
     )
 
@@ -399,7 +561,9 @@ def offline_seed_prune_safetensors(
                 new_key, new_tensor = _transform_tensor(
                     key,
                     tensor,
+                    layer_prefixes=layer_prefixes,
                     moe_paths=moe_paths,
+                    expert_paths=expert_paths,
                     router_attr=router_attr,
                     num_experts=num_experts,
                     retained_by_layer=retained_by_layer,
@@ -448,6 +612,9 @@ def offline_seed_prune_safetensors(
         "seed": seed,
         "num_layers": len(layers),
         "layers": layers,
+        "layer_prefixes": layer_prefixes,
+        "moe_paths": moe_paths,
+        "expert_paths": expert_paths,
         "retained_indices_by_layer": {str(k): v for k, v in retained_by_layer.items()},
         "output_total_size_bytes": output_total_size,
     }

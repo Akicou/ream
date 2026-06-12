@@ -29,6 +29,7 @@
   - MiMo (MiMoV2ForCausalLM, MiMoV2FlashForCausalLM)
   - LongCat (LongcatCausalLM, LongcatForCausalLM)
   - MiniMax (MiniMaxM2ForCausalLM)
+  - DiffusionGemma (DiffusionGemmaForBlockDiffusion)
 - **Multiple compression methods**:
   - Expert pruning (remove low-saliency experts)
   - Expert merging (combine similar experts)
@@ -138,6 +139,7 @@ retained_counts = merge_model(model, observer_data, config)
 | MiMo V2 | `MiMoV2FlashForCausalLM` | No | 309B parameter model |
 | LongCat | `LongcatCausalLM` | No | 512 real + 256 zero experts |
 | MiniMax M2.5 | `MiniMaxM2ForCausalLM` | No | Uses w1/w2/w3 naming |
+| DiffusionGemma 26B-A4B | `DiffusionGemmaForBlockDiffusion` | Yes | Experts live directly on `model.decoder.layers.*` |
 
 ## Calibration Datasets
 

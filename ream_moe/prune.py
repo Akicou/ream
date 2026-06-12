@@ -88,6 +88,105 @@ def _get_num_experts_from_moe_block(
     raise ValueError(f"Cannot determine number of experts from {moe_block.__class__.__name__}")
 
 
+def _set_existing_int_attr(obj: Any, attr_name: str, value: int) -> None:
+    """Set an existing integer-ish metadata attribute without creating new API."""
+    if hasattr(obj, attr_name):
+        current = getattr(obj, attr_name)
+        if isinstance(current, int) and not isinstance(current, bool):
+            setattr(obj, attr_name, int(value))
+
+
+def _sync_expert_count_metadata(moe_block: nn.Module, retained_count: int, attrs: Dict[str, Any]) -> None:
+    """Keep per-layer module metadata consistent with physically pruned experts."""
+    for obj in [moe_block]:
+        for name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
+            _set_existing_int_attr(obj, name, retained_count)
+
+    experts_attr = attrs.get("experts", "experts")
+    try:
+        experts_obj: Any = moe_block
+        for part in experts_attr.split("."):
+            experts_obj = getattr(experts_obj, part)
+        for name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
+            _set_existing_int_attr(experts_obj, name, retained_count)
+    except AttributeError:
+        pass
+
+    router_attr = attrs.get("router", "gate")
+    if hasattr(moe_block, router_attr):
+        router = getattr(moe_block, router_attr)
+        for name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
+            _set_existing_int_attr(router, name, retained_count)
+
+        # Keep top-k valid for aggressive pruning. Otherwise topk() can request
+        # more experts than remain after the router/expert axes were shrunk.
+        for name in [
+            "top_k", "topk", "top_k_experts", "num_experts_per_tok",
+            "k", "num_selected_experts", "moe_topk",
+        ]:
+            if hasattr(router, name):
+                current = getattr(router, name)
+                if isinstance(current, int) and not isinstance(current, bool) and current > retained_count:
+                    setattr(router, name, retained_count)
+
+    for name in [
+        "top_k", "topk", "top_k_experts", "num_experts_per_tok",
+        "k", "num_selected_experts", "moe_topk",
+    ]:
+        if hasattr(moe_block, name):
+            current = getattr(moe_block, name)
+            if isinstance(current, int) and not isinstance(current, bool) and current > retained_count:
+                setattr(moe_block, name, retained_count)
+
+
+def _get_nested_attr_or_key(obj: Any, attr_path: str) -> Any:
+    """Read existing attr/dict-key path such as config.gate.top_k."""
+    if not attr_path:
+        return None
+    if attr_path.startswith("config."):
+        attr_path = attr_path.split(".", 1)[1]
+    current = obj
+    for part in [part for part in attr_path.split(".") if part]:
+        if isinstance(current, dict):
+            if part not in current:
+                return None
+            current = current[part]
+        elif hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            return None
+    return current
+
+
+def _set_nested_attr_if_present(obj: Any, attr_path: str, value: int) -> bool:
+    """Set an existing attr/dict-key path; never creates new paths."""
+    if not attr_path:
+        return False
+    if attr_path.startswith("config."):
+        attr_path = attr_path.split(".", 1)[1]
+    parts = [part for part in attr_path.split(".") if part]
+    if not parts:
+        return False
+    current = obj
+    for part in parts[:-1]:
+        if isinstance(current, dict):
+            if part not in current:
+                return False
+            current = current[part]
+        elif hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            return False
+    leaf = parts[-1]
+    if isinstance(current, dict) and leaf in current:
+        current[leaf] = value
+        return True
+    if hasattr(current, leaf):
+        setattr(current, leaf, value)
+        return True
+    return False
+
+
 def prune_layer(
     model: nn.Module,
     layer_idx: int,
@@ -135,6 +234,8 @@ def prune_layer(
         _prune_fused_experts(moe_block, retained_indices, attrs)
     else:
         _prune_separate_experts(moe_block, retained_indices, attrs)
+
+    _sync_expert_count_metadata(moe_block, len(retained_indices), attrs)
 
     return len(retained_indices)
 
@@ -192,6 +293,41 @@ def _prune_separate_experts(
 
     # Prune router
     _prune_router(moe_block, retained_indices, attrs)
+
+
+def _prune_router_expert_axis_tensor(router: Any, attr_path: str, retained_indices: List[int]) -> None:
+    """Prune a router tensor attribute indexed by expert id."""
+    parts = [part for part in attr_path.split(".") if part]
+    if not parts:
+        return
+
+    parent = router
+    for part in parts[:-1]:
+        if not hasattr(parent, part):
+            return
+        parent = getattr(parent, part)
+
+    leaf = parts[-1]
+    if not hasattr(parent, leaf):
+        return
+
+    value = getattr(parent, leaf)
+    data = value.data if isinstance(value, nn.Parameter) else value
+    if not isinstance(data, torch.Tensor) or data.ndim == 0:
+        return
+
+    idx_tensor = torch.as_tensor(retained_indices, device=data.device)
+    if data.shape[0] > max(retained_indices, default=-1):
+        pruned = data.index_select(0, idx_tensor)
+    elif data.shape[-1] > max(retained_indices, default=-1):
+        pruned = data.index_select(data.ndim - 1, idx_tensor)
+    else:
+        return
+
+    if isinstance(value, nn.Parameter):
+        value.data = pruned
+    else:
+        setattr(parent, leaf, pruned)
 
 
 def _prune_router(
@@ -253,6 +389,9 @@ def _prune_router(
         if hasattr(router, "num_experts"):  # transformers >= 4.54+
             router.num_experts = len(retained_indices)
 
+    for attr_path in attrs.get("router_expert_attrs", []):
+        _prune_router_expert_axis_tensor(router, str(attr_path), retained_indices)
+
     # Remap DeepSeek-V4 hash router token-id -> expert-id tables.
     # Pruned expert ids are mapped to the first retained expert so indices stay
     # in range; retained ids are remapped to their new compact positions.
@@ -280,28 +419,48 @@ def _update_model_config(
     num_retained_experts: int,
     attrs: Dict[str, Any],
 ) -> None:
-    """Update model config to reflect new expert count."""
-    num_experts_attr = attrs.get("num_experts", "num_experts")
+    """Update saved config metadata to reflect physically pruned experts."""
+    if not hasattr(model, "config"):
+        return
 
-    if num_experts_attr.startswith("config."):
-        config_key = num_experts_attr.split(".", 1)[1]
-        if hasattr(model.config, config_key):
-            setattr(model.config, config_key, num_retained_experts)
-    else:
-        # Try to update config directly using the attribute name
-        if hasattr(model.config, num_experts_attr):
-            setattr(model.config, num_experts_attr, num_retained_experts)
+    expert_count_paths = [
+        str(attrs.get("num_experts", "")),
+        "num_experts",
+        "num_local_experts",
+        "n_routed_experts",
+        "moe_num_experts",
+        "text_config.num_experts",
+    ]
+    for path in expert_count_paths:
+        _set_nested_attr_if_present(model.config, path, num_retained_experts)
 
-    # Handle special cases
-    model_class = model.__class__.__name__
+    if hasattr(model.config, "moe_capacity") and isinstance(model.config.moe_capacity, list):
+        model.config.moe_capacity = [
+            num_retained_experts if isinstance(item, int) and not isinstance(item, bool) else item
+            for item in model.config.moe_capacity
+        ]
 
-    if model_class == "Ernie4_5_MoeForCausalLM":
-        if hasattr(model.config, "moe_capacity"):
-            model.config.moe_capacity = [
-                num_retained_experts,
-                num_retained_experts,
-                num_retained_experts,
-            ]
+    topk_paths = [
+        str(attrs.get("num_experts_per_tok", "")),
+        "num_experts_per_tok",
+        "moe_k",
+        "moe_topk",
+        "top_k",
+        "topk",
+        "top_k_experts",
+        "num_selected_experts",
+        "text_config.top_k_experts",
+        "text_config.num_experts_per_tok",
+        "text_config.top_k",
+        "gate.top_k",
+        "gate.topk",
+        "router.top_k",
+        "router.topk",
+    ]
+    for path in topk_paths:
+        current = _get_nested_attr_or_key(model.config, path)
+        if isinstance(current, int) and not isinstance(current, bool) and current > num_retained_experts:
+            _set_nested_attr_if_present(model.config, path, num_retained_experts)
 
 
 def compute_experts_to_prune(

@@ -34,6 +34,36 @@ def _as_attr_paths(value: Any, default: str = "mlp") -> List[str]:
     return [str(value)]
 
 
+def _get_nested_attr(obj: Any, path: str) -> Any:
+    """Read dotted attributes/keys, returning None if any component is missing."""
+    current = obj
+    for part in [part for part in path.split(".") if part]:
+        if isinstance(current, dict):
+            if part not in current:
+                return None
+            current = current[part]
+        elif hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            return None
+    return current
+
+
+def _get_layers(model: nn.Module) -> Any:
+    """Find the decoder layer container across common HF model wrappers."""
+    for path in [
+        "model.layers",
+        "layers",
+        "model.decoder.layers",
+        "decoder.layers",
+        "transformer.h",
+    ]:
+        layers = _get_nested_attr(model, path)
+        if layers is not None:
+            return layers
+    return None
+
+
 def get_moe_block(model: nn.Module, layer_idx: int) -> nn.Module:
     """
     Get the MoE block for a specific decoder layer.
@@ -60,14 +90,8 @@ def get_moe_block(model: nn.Module, layer_idx: int) -> nn.Module:
     moe_attr_paths = _as_attr_paths(attrs.get("moe_block", "mlp"))
 
     # Navigate to the layer's MoE block
-    layers = None
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "layers"):
-        layers = model.layers
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        layers = model.transformer.h  # GPT-2 style
-    else:
+    layers = _get_layers(model)
+    if layers is None:
         raise ValueError(f"Cannot find layers in model {model_class}")
 
     if layer_idx >= len(layers):
@@ -78,6 +102,8 @@ def get_moe_block(model: nn.Module, layer_idx: int) -> nn.Module:
     # Handle nested attributes (e.g., "block_sparse_moe") and models with
     # multiple known aliases for the MoE block (e.g., DeepSeek-V4 ffn vs mlp).
     for moe_attr_name in moe_attr_paths:
+        if moe_attr_name in ["", ".", "self"]:
+            return layer
         try:
             return reduce(getattr, moe_attr_name.split("."), layer)
         except AttributeError:
@@ -121,11 +147,15 @@ def get_num_experts(model: nn.Module, layer_idx: int = 0) -> int:
     # Try to get from config first
     num_experts_attr = attrs.get("num_experts", "num_experts")
 
-    if num_experts_attr.startswith("config."):
-        # Get from model.config
-        config_key = num_experts_attr.split(".", 1)[1]
-        if hasattr(model, "config") and hasattr(model.config, config_key):
-            return getattr(model.config, config_key)
+    if hasattr(model, "config"):
+        config_path = (
+            num_experts_attr.split(".", 1)[1]
+            if num_experts_attr.startswith("config.")
+            else num_experts_attr
+        )
+        config_value = _get_nested_attr(model.config, config_path)
+        if isinstance(config_value, int):
+            return config_value
 
     # Try to get from MoE block attribute
     moe_block = get_moe_block(model, layer_idx)
@@ -173,10 +203,15 @@ def get_top_k(model: nn.Module, layer_idx: int = 0) -> int:
     top_k_attr = attrs.get("num_experts_per_tok", "top_k")
 
     # Try to get from config first
-    if top_k_attr.startswith("config."):
-        config_key = top_k_attr.split(".", 1)[1]
-        if hasattr(model, "config") and hasattr(model.config, config_key):
-            return getattr(model.config, config_key)
+    if hasattr(model, "config"):
+        config_path = (
+            top_k_attr.split(".", 1)[1]
+            if top_k_attr.startswith("config.")
+            else top_k_attr
+        )
+        config_value = _get_nested_attr(model.config, config_path)
+        if isinstance(config_value, int):
+            return config_value
 
     # Try to get from MoE block attribute
     moe_block = get_moe_block(model, layer_idx)
@@ -189,7 +224,7 @@ def get_top_k(model: nn.Module, layer_idx: int = 0) -> int:
         pass
 
     # Fallback: try common patterns on the MoE block and its router.
-    for attr_name in ["top_k", "topk", "num_experts_per_tok", "k", "num_selected_experts"]:
+    for attr_name in ["top_k", "topk", "top_k_experts", "num_experts_per_tok", "k", "num_selected_experts"]:
         if hasattr(moe_block, attr_name):
             val = getattr(moe_block, attr_name)
             if isinstance(val, int):
@@ -198,7 +233,7 @@ def get_top_k(model: nn.Module, layer_idx: int = 0) -> int:
     router_attr = attrs.get("router", "gate")
     if hasattr(moe_block, router_attr):
         router = getattr(moe_block, router_attr)
-        for attr_name in ["top_k", "topk", "num_experts_per_tok", "k", "num_selected_experts"]:
+        for attr_name in ["top_k", "topk", "top_k_experts", "num_experts_per_tok", "k", "num_selected_experts"]:
             if hasattr(router, attr_name):
                 val = getattr(router, attr_name)
                 if isinstance(val, int):
@@ -217,14 +252,8 @@ def list_moe_layers(model: nn.Module) -> List[int]:
     Returns:
         List of layer indices containing MoE blocks
     """
-    layers = None
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "layers"):
-        layers = model.layers
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        layers = model.transformer.h
-    else:
+    layers = _get_layers(model)
+    if layers is None:
         return []
 
     moe_layers = []
@@ -235,7 +264,9 @@ def list_moe_layers(model: nn.Module) -> List[int]:
 
     for idx, layer in enumerate(layers):
         for moe_attr_name in moe_attr_paths:
-            if moe_attr_name in ["mlp"] and hasattr(layer, "mlp"):
+            if moe_attr_name in ["", ".", "self"]:
+                moe_block = layer
+            elif moe_attr_name in ["mlp"] and hasattr(layer, "mlp"):
                 moe_block = layer.mlp
             elif moe_attr_name in ["block_sparse_moe"] and hasattr(layer, "block_sparse_moe"):
                 moe_block = layer.block_sparse_moe
@@ -508,16 +539,7 @@ def _verify_model_structure(
     errors = []
 
     # Find a decoder layer to inspect
-    layers = None
-    if hasattr(model, "model"):
-        if hasattr(model.model, "layers"):
-            layers = model.model.layers
-        elif hasattr(model.model, "decoder"):
-            if hasattr(model.model.decoder, "layers"):
-                layers = model.model.decoder.layers
-    elif hasattr(model, "layers"):
-        layers = model.layers
-
+    layers = _get_layers(model)
     if layers is None or len(layers) == 0:
         return ["Could not find any decoder layers in the model"]
 
@@ -533,16 +555,20 @@ def _verify_model_structure(
 
     for idx, candidate_layer in enumerate(layers):
         for moe_block_path in moe_block_paths:
-            # Navigate to MoE block
-            current = candidate_layer
-            block = None
-            for attr in moe_block_path.split("."):
-                if hasattr(current, attr):
-                    block = getattr(current, attr)
-                    current = block
-                else:
-                    block = None
-                    break
+            # Navigate to MoE block. Empty path means the decoder layer itself
+            # is the MoE block (DiffusionGemma-style layout).
+            if moe_block_path in ["", ".", "self"]:
+                block = candidate_layer
+            else:
+                current = candidate_layer
+                block = None
+                for attr in moe_block_path.split("."):
+                    if hasattr(current, attr):
+                        block = getattr(current, attr)
+                        current = block
+                    else:
+                        block = None
+                        break
 
             if block is not None:
                 # Check if this block actually has MoE (experts attribute)

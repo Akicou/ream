@@ -667,6 +667,33 @@ def _update_router_for_merge(
         if hasattr(router, "num_experts"):
             router.num_experts = len(groups)
 
+    for attr_path in attrs.get("router_expert_attrs", []):
+        parts = [part for part in str(attr_path).split(".") if part]
+        if not parts:
+            continue
+        parent = router
+        for part in parts[:-1]:
+            if not hasattr(parent, part):
+                parent = None
+                break
+            parent = getattr(parent, part)
+        if parent is None or not hasattr(parent, parts[-1]):
+            continue
+        value = getattr(parent, parts[-1])
+        data = value.data if isinstance(value, nn.Parameter) else value
+        if not isinstance(data, torch.Tensor) or data.ndim == 0:
+            continue
+        if data.shape[0] >= max(max(g) for g in groups) + 1:
+            merged_value = merge_expert_rows(data)
+        elif data.shape[-1] >= max(max(g) for g in groups) + 1:
+            merged_value = merge_expert_columns(data)
+        else:
+            continue
+        if isinstance(value, nn.Parameter):
+            value.data = merged_value
+        else:
+            setattr(parent, parts[-1], merged_value)
+
     # Remap DeepSeek-V4 hash router token-id -> expert-id tables from old
     # expert ids to new merged group ids.
     if hasattr(router, "tid2eid"):
@@ -733,10 +760,72 @@ def merge_model(
                 "Skipping scalar model.config expert-count update."
             )
         else:
-            for attr_name in ["num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"]:
-                if hasattr(model.config, attr_name):
+            attrs = get_model_attrs(model.__class__.__name__) or {}
+
+            def get_config_path(path: str) -> Any:
+                if path.startswith("config."):
+                    path = path.split(".", 1)[1]
+                current: Any = model.config
+                for part in [part for part in path.split(".") if part]:
+                    if isinstance(current, dict):
+                        if part not in current:
+                            return None
+                        current = current[part]
+                    elif hasattr(current, part):
+                        current = getattr(current, part)
+                    else:
+                        return None
+                return current
+
+            def set_config_path(path: str, value: int) -> bool:
+                if path.startswith("config."):
+                    path = path.split(".", 1)[1]
+                parts = [part for part in path.split(".") if part]
+                if not parts:
+                    return False
+                current: Any = model.config
+                for part in parts[:-1]:
+                    if isinstance(current, dict):
+                        if part not in current:
+                            return False
+                        current = current[part]
+                    elif hasattr(current, part):
+                        current = getattr(current, part)
+                    else:
+                        return False
+                if isinstance(current, dict) and parts[-1] in current:
+                    current[parts[-1]] = value
+                    return True
+                if hasattr(current, parts[-1]):
+                    setattr(current, parts[-1], value)
+                    return True
+                return False
+
+            for attr_name in [
+                str(attrs.get("num_experts", "")),
+                "num_experts",
+                "num_local_experts",
+                "n_routed_experts",
+                "moe_num_experts",
+                "text_config.num_experts",
+            ]:
+                if set_config_path(attr_name, final_expert_count):
                     logger.info(f"Updating model.config.{attr_name} = {final_expert_count}")
-                    setattr(model.config, attr_name, final_expert_count)
+
+            for attr_name in [
+                str(attrs.get("num_experts_per_tok", "")),
+                "num_experts_per_tok",
+                "moe_k",
+                "moe_topk",
+                "top_k",
+                "topk",
+                "top_k_experts",
+                "num_selected_experts",
+                "text_config.top_k_experts",
+            ]:
+                current = get_config_path(attr_name)
+                if isinstance(current, int) and current > final_expert_count:
+                    set_config_path(attr_name, final_expert_count)
 
     # Log summary
     if retained_counts:

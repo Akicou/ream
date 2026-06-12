@@ -5,11 +5,14 @@ This module contains MODEL_ATTRS - a mapping of model class names to their
 MoE-specific attributes needed for compression operations.
 
 Each model configuration specifies:
-- moe_block: Name of the MoE block attribute in decoder layers
+- layer_prefix: Optional safetensors decoder-layer key prefix for offline pruning
+- moe_block: Name of the MoE block attribute in decoder layers; empty means layer itself
 - gate_proj/up_proj/down_proj: Projection layer names within experts
 - experts: Name of the experts container (ModuleList or fused tensor)
 - fused: Whether experts use fused (gate_up_proj) vs separate projections
 - router: Name of the router/gate module
+- router_weight_attr: Optional nested router weight path (e.g. proj.weight)
+- router_expert_attrs: Optional router tensors indexed by expert id
 - num_experts: Config attribute name for total expert count
 - num_experts_per_tok: Config attribute name for top-k routing
 """
@@ -307,6 +310,25 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "router": "gate",
         "num_experts": "num_local_experts",
         "num_experts_per_tok": "num_experts_per_tok",
+    },
+
+    # DiffusionGemma 26B-A4B - block diffusion multimodal model.
+    # Text decoder MoE tensors are stored directly on decoder layers:
+    # model.decoder.layers.N.experts.{gate_up_proj,down_proj} and
+    # model.decoder.layers.N.router.{proj.weight,per_expert_scale,scale}.
+    "DiffusionGemmaForBlockDiffusion": {
+        "layer_prefix": "model.decoder.layers",
+        "moe_block": "",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "router",
+        "router_weight_attr": "proj.weight",
+        "router_expert_attrs": ["per_expert_scale"],
+        "num_experts": "text_config.num_experts",
+        "num_experts_per_tok": "text_config.top_k_experts",
     },
 
     # gpt-oss models (OpenAI-like architecture)
