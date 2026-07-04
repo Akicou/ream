@@ -16,8 +16,8 @@
   - Gated similarity + pseudo-pruning grouping
   - Permutation-aware expert merging (Hungarian alignment)
   - Router (gate) weight adjustment
-- **Production-ready model support** for 15+ MoE model families:
-  - Qwen (Qwen3Moe, NonUniformQwen3Moe)
+- **Production-ready model support** for 17+ MoE model families:
+  - Qwen (Qwen3Moe, NonUniformQwen3Moe, Qwen3.5Moe)
   - Llama4 (Llama4ForCausalLM)
   - Mixtral (MixtralForCausalLM)
   - DeepSeek (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV4ForCausalLM)
@@ -28,7 +28,7 @@
   - Vaetki (VaetkiForCausalLM)
   - MiMo (MiMoV2ForCausalLM, MiMoV2FlashForCausalLM)
   - LongCat (LongcatCausalLM, LongcatForCausalLM)
-  - MiniMax (MiniMaxM2ForCausalLM)
+  - MiniMax (MiniMaxM2ForCausalLM, MiniMaxM3Sparse)
   - DiffusionGemma (DiffusionGemmaForBlockDiffusion)
 - **Multiple compression methods**:
   - Expert pruning (remove low-saliency experts)
@@ -122,8 +122,9 @@ retained_counts = merge_model(model, observer_data, config)
 
 | Model Family | Model Class | Fused Experts | Notes |
 |-------------|-------------|---------------|-------|
-| Qwen3 MoE | `Qwen3MoeForCausalLM` | No | Standard Qwen MoE |
+| Qwen3 MoE | `Qwen3MoeForCausalLM` | No | Standard Qwen MoE, separate projections |
 | Qwen3 NonUniform | `NonUniformQwen3MoeForCausalLM` | No | Non-uniform expert allocation |
+| Qwen3.5 MoE | `Qwen3_5MoeForConditionalGeneration` | Yes | 512 experts, top_k=10, multimodal, shared experts |
 | Llama4 | `Llama4ForCausalLM` | Yes | Fused gate_up_proj |
 | Mixtral | `MixtralForCausalLM` | No | Uses w1/w2/w3 naming |
 | DeepSeek V2 | `DeepseekV2ForCausalLM` | No | 160 experts, top_k=6 |
@@ -138,7 +139,8 @@ retained_counts = merge_model(model, observer_data, config)
 | MiMo V2.5 | `MiMoV2ForCausalLM` | No | 256 experts, top_k=8, multimodal/audio |
 | MiMo V2 | `MiMoV2FlashForCausalLM` | No | 309B parameter model |
 | LongCat | `LongcatCausalLM` | No | 512 real + 256 zero experts |
-| MiniMax M2.5 | `MiniMaxM2ForCausalLM` | No | Uses w1/w2/w3 naming |
+| MiniMax M2.5 | `MiniMaxM2ForCausalLM` | No | Text-only, w1/w2/w3 naming |
+| MiniMax M3 | `MiniMaxM3SparseForConditionalGeneration` | No | 128 experts, top_k=4, multimodal, shared experts, e_score_correction_bias |
 | DiffusionGemma 26B-A4B | `DiffusionGemmaForBlockDiffusion` | Yes | Experts live directly on `model.decoder.layers.*` |
 
 ## Calibration Datasets
