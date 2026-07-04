@@ -218,6 +218,22 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts_per_tok": "num_experts_per_tok",
     },
 
+    # Qwen3.5 MoE — multimodal models (e.g., Qwen3.5-397B-A17B, Qwen3.5-35B-A3B).
+    # Uses FUSED experts (gate_up_proj), has shared_expert + shared_expert_gate.
+    # Config fields are nested under text_config; safetensors prefix is model.language_model.
+    "Qwen3_5MoeForConditionalGeneration": {
+        "layer_prefix": "model.language_model.layers",
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "text_config.num_experts",
+        "num_experts_per_tok": "text_config.num_experts_per_tok",
+    },
+
     # Vaetki MoE
     "VaetkiForCausalLM": {
         "moe_block": "mlp",
@@ -299,7 +315,7 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts_per_tok": "moe_topk",
     },
 
-    # MiniMax M2.5 - Uses w1/w2/w3 projections
+    # MiniMax M2.5 — text-only MoE (kept for backward compatibility).
     "MiniMaxM2ForCausalLM": {
         "moe_block": "block_sparse_moe",
         "gate_proj": "w1",
@@ -310,6 +326,24 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "router": "gate",
         "num_experts": "num_local_experts",
         "num_experts_per_tok": "num_experts_per_tok",
+    },
+
+    # MiniMax M3 — multimodal MoE (MiniMaxM3SparseForConditionalGeneration).
+    # 128 routed experts (top_k=4), non-fused w1/w2/w3, shared experts, sigmoid scoring.
+    # 3 dense layers (0-2) + 57 MoE layers (3-59). Safetensors prefix:
+    # language_model.model.layers.N.block_sparse_moe.experts.N.{w1,w2,w3}.
+    # Router has weight + e_score_correction_bias on the MoE block.
+    "MiniMaxM3SparseForConditionalGeneration": {
+        "layer_prefix": "language_model.model.layers",
+        "moe_block": "block_sparse_moe",
+        "gate_proj": "w1",
+        "up_proj": "w3",
+        "down_proj": "w2",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "text_config.num_local_experts",
+        "num_experts_per_tok": "text_config.num_experts_per_tok",
     },
 
     # DiffusionGemma 26B-A4B - block diffusion multimodal model.

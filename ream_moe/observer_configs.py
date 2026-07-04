@@ -190,6 +190,16 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
         },
     ),
 
+    # Qwen3.5 MoE — multimodal models with fused experts + shared experts
+    "Qwen3_5MoeForConditionalGeneration": type(
+        "Qwen3_5MoEObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "Qwen3_5MoeSparseMoeBlock",
+            "fused_experts": True,
+        },
+    ),
+
     # Vaetki MoE
     "VaetkiForCausalLM": type(
         "VaetkiObserverConfig",
@@ -258,6 +268,17 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
         {
             "module_class_name_to_hook_regex": "MiniMaxM2SparseMoeBlock",
             "num_experts_attr_name": "experts.num_experts",
+            "top_k_attr_name": "top_k",
+        },
+    ),
+
+    # MiniMax M3 — multimodal MoE, sigmoid scoring, e_score_correction_bias
+    "MiniMaxM3SparseForConditionalGeneration": type(
+        "MiniMaxM3ObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "MiniMaxM3SparseMoeBlock|BlockSparseTop2MLP",
+            "num_experts_attr_name": "num_local_experts",
             "top_k_attr_name": "top_k",
         },
     ),
