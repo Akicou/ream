@@ -283,6 +283,28 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
         },
     ),
 
+    # Tencent Hy3 (HYV3ForCausalLM) — 192 routed experts, sigmoid router, 1 shared expert
+    # Router is nested (module.router.gate.weight), sigmoid scoring with expert_bias.
+    "HYV3ForCausalLM": type(
+        "HyV3ObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "HyV3MLP|HyV3MoE|HyV3SparseMoe|HyV3MoeMLP",
+            "num_experts_attr_name": "num_experts",
+            "top_k_attr_name": "top_k",
+        },
+    ),
+
+    # DiffusionGemma 26B-A4B — block-diffusion multimodel
+    "DiffusionGemmaForBlockDiffusion": type(
+        "DiffusionGemmaObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "DiffusionGemmaTextSparseMoe|SparseMoe",
+            "fused_experts": True,
+        },
+    ),
+
     # gpt-oss models
     "gpt-oss-20b": type(
         "GptOssObserverConfig",

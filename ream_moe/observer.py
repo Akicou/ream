@@ -345,6 +345,9 @@ class MoEObserver:
             correction_bias = getattr(router, "e_score_correction_bias", None)
             if correction_bias is None:
                 correction_bias = getattr(router, "bias", None)
+            # Tencent Hy3 stores expert_bias directly on the MoE block
+            if correction_bias is None:
+                correction_bias = getattr(module, "expert_bias", None)
             if correction_bias is not None:
                 selection_scores = selection_scores + correction_bias.to(selection_scores.device)
 

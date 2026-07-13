@@ -41,6 +41,9 @@ class MergeConfig:
     saliency_metric: str = "saliency_scores"  # Metric to use for centroid selection
     use_cpu_for_weights: bool = False  # Process expert weights on CPU to save GPU memory
     skip_permutation: bool = False  # Skip Hungarian algorithm for faster merging (simple averaging)
+    min_similarity: float = 0.0  # Minimum cosine similarity threshold for grouping (0.0 = no threshold)
+    sequential_merging: bool = False  # Recompute hidden states after each merged layer (REAM paper)
+    avg_router: bool = False  # Average grouped router rows (default: keep centroid only like REAM)
 
 
 def merge_layer(
@@ -116,7 +119,8 @@ def merge_layer(
     )
 
     # Step 5: Update model with merged weights
-    _update_merged_weights(moe_block, merged_weights, groups, attrs, saliency)
+    avg_router = getattr(config, 'avg_router', False)
+    _update_merged_weights(moe_block, merged_weights, groups, attrs, saliency, avg_router=avg_router)
 
     return len(groups)
 
@@ -171,34 +175,26 @@ def _compute_saliency_scores(
         actual_top_k = min(actual_top_k, N)
         topk_vals, topk_idx = torch.topk(probs, k=actual_top_k, dim=-1)
 
-    # Memory-efficient vectorized approach: iterate but with batched operations
+    # REAP saliency: S[i] = mean_{tokens routed to i} ||h_i(x)|| * p_i(x)
+    # Vectorized: for each expert, find tokens where it was selected and
+    # compute the weighted norm only over those tokens.
     saliency = torch.zeros(N, device=router_logits.device)
-    
-    # Process in chunks to balance memory and speed
-    chunk_size = max(1, N // 8)  # Process 1/8 of experts at a time
-    
-    for start_idx in range(0, N, chunk_size):
-        end_idx = min(start_idx + chunk_size, N)
-        
-        # For this chunk of experts, find all positions where they appear in top-k
-        chunk_experts = torch.arange(start_idx, end_idx, device=topk_idx.device)
-        
-        # Create mask: [T, top_k, chunk_size]
-        mask = (topk_idx.unsqueeze(-1) == chunk_experts.unsqueeze(0).unsqueeze(0))  # [T, top_k, chunk_size]
-        
-        # Get corresponding values
-        chunk_saliency = torch.zeros(end_idx - start_idx, device=router_logits.device)
-        
-        for local_idx, global_idx in enumerate(chunk_experts.tolist()):
-            expert_mask = mask[..., local_idx]  # [T, top_k]
-            if expert_mask.any():
-                # Get token positions and within-topk positions
-                token_idx, within_topk_idx = torch.where(expert_mask)
-                h_i = expert_outputs[global_idx, token_idx]
-                p_i = topk_vals[token_idx, within_topk_idx]
-                chunk_saliency[local_idx] = (h_i.norm(dim=-1) * p_i).mean()
-        
-        saliency[start_idx:end_idx] = chunk_saliency
+
+    for i in range(N):
+        token_idx, within_topk_idx = torch.where(topk_idx == i)
+        if token_idx.numel() == 0:
+            continue
+        h_i = expert_outputs[i, token_idx]
+        p_i = topk_vals[token_idx, within_topk_idx]
+        saliency[i] = (h_i.norm(dim=-1) * p_i).mean()
+
+    # Replace zero saliency with a small non-zero value so experts that were
+    # never selected during calibration can still potentially be merged (REAM paper).
+    zeros = saliency == 0
+    n_zeros = zeros.sum().item()
+    if n_zeros > 0 and n_zeros < N:
+        min_nonzero = saliency[saliency > 0].min().item()
+        saliency[zeros] = min(0.5, min_nonzero)
 
     return saliency
 
@@ -281,9 +277,16 @@ def _group_experts_around_centroids(
         # Sort by similarity and take top group_size-1
         _, order = torch.sort(sim, descending=True)
         ordered_unused = unused_idx[order]
+        ordered_sim = sim[order]
 
         max_group = config.group_size
-        for idx in ordered_unused[: max_group - 1]:
+        for local_pos, idx in enumerate(ordered_unused[: max_group - 1]):
+            # Respect minimum similarity threshold: stop adding experts once
+            # similarity drops below the configured floor. This prevents
+            # dissimilar experts from being merged into the centroid,
+            # leaving them as singletons (pseudo-pruning) instead.
+            if config.min_similarity > 0 and ordered_sim[local_pos] < config.min_similarity:
+                break
             idx_int = int(idx.item())
             group.append(idx_int)
             used[idx_int] = True
@@ -503,6 +506,7 @@ def _update_merged_weights(
     groups: List[List[int]],
     attrs: Dict[str, Any],
     saliency: torch.Tensor,
+    avg_router: bool = False,
 ) -> None:
     """
     Write merged expert weights back to the model and update the router.
@@ -577,7 +581,7 @@ def _update_merged_weights(
         setattr(moe_block, experts_attr, new_experts)
 
     # Shrink router to one output per merged expert group
-    _update_router_for_merge(moe_block, groups, attrs, saliency)
+    _update_router_for_merge(moe_block, groups, attrs, saliency, avg_router=avg_router)
 
 
 def _update_router_for_merge(
@@ -585,22 +589,41 @@ def _update_router_for_merge(
     groups: List[List[int]],
     attrs: Dict[str, Any],
     saliency: torch.Tensor,
+    avg_router: bool = False,
 ) -> None:
     """
     Update router weights to output one merged route per expert group.
+
+    By default (``avg_router=False``), follows the REAM paper: keeps only the
+    centroid expert's router row for each group and drops the rest \u2014 matching
+    the original SamsungSAILMontreal/ream implementation.  When ``avg_router=True``
+    the router rows are saliency-weighted averaged across group members which can
+    help when non-centroid experts were frequently activated for different tokens.
 
     Args:
         moe_block: The MoE block
         groups: Expert groups (first element of each is the centroid)
         attrs: Model attributes
         saliency: Per-expert saliency scores used for weighted router merging
+        avg_router: If True, average router rows across the group;
+                    if False (default, REAM paper), keep only centroid rows.
     """
     router_attr = attrs.get("router", "gate")
     router_weight_attr = attrs.get("router_weight_attr")
     router = getattr(moe_block, router_attr)
 
+    def _pick_centroid_rows(tensor: torch.Tensor) -> torch.Tensor:
+        """Keep only the centroid (first) row from each group \u2014 REAM paper."""
+        centroid_idx = torch.as_tensor([g[0] for g in groups], device=tensor.device, dtype=torch.long)
+        return tensor.index_select(0, centroid_idx)
+
+    def _pick_centroid_cols(tensor: torch.Tensor) -> torch.Tensor:
+        """Keep only the centroid (first) column from each group \u2014 REAM paper."""
+        centroid_idx = torch.as_tensor([g[0] for g in groups], device=tensor.device, dtype=torch.long)
+        return tensor.index_select(tensor.ndim - 1, centroid_idx)
+
     def merge_expert_rows(tensor: torch.Tensor) -> torch.Tensor:
-        """Merge row-0 expert axis using the same saliency weights as experts."""
+        """Saliency-weighted average of group rows."""
         merged_rows: List[torch.Tensor] = []
         for group in groups:
             idx = torch.as_tensor(group, device=tensor.device, dtype=torch.long)
@@ -611,7 +634,7 @@ def _update_router_for_merge(
         return torch.stack(merged_rows, dim=0)
 
     def merge_expert_columns(tensor: torch.Tensor) -> torch.Tensor:
-        """Merge last expert axis, used by some correction-bias tensors."""
+        """Saliency-weighted average of group columns."""
         merged_cols: List[torch.Tensor] = []
         for group in groups:
             idx = torch.as_tensor(group, device=tensor.device, dtype=torch.long)
@@ -620,6 +643,12 @@ def _update_router_for_merge(
             view_shape = (1,) * (selected.ndim - 1) + (len(group),)
             merged_cols.append((selected * weights.view(view_shape)).sum(dim=-1))
         return torch.stack(merged_cols, dim=-1)
+
+    # Choose the mutation function for the expert axis.
+    if avg_router:
+        row_fn, col_fn = merge_expert_rows, merge_expert_columns
+    else:
+        row_fn, col_fn = _pick_centroid_rows, _pick_centroid_cols
 
     if router_weight_attr and "." in router_weight_attr:
         # Handle nested router (e.g., LongCat's router.classifier)
@@ -630,7 +659,7 @@ def _update_router_for_merge(
 
         weight_attr = parts[-1]
         weight = getattr(inner, weight_attr)
-        new_weight = merge_expert_rows(weight.data if isinstance(weight, nn.Parameter) else weight)
+        new_weight = row_fn(weight.data if isinstance(weight, nn.Parameter) else weight)
         if isinstance(weight, nn.Parameter):
             weight.data = new_weight
         else:
@@ -640,7 +669,7 @@ def _update_router_for_merge(
         bias_attr = weight_attr.replace("weight", "bias")
         if hasattr(inner, bias_attr) and getattr(inner, bias_attr) is not None:
             bias = getattr(inner, bias_attr)
-            new_bias = merge_expert_rows(bias.data if isinstance(bias, nn.Parameter) else bias)
+            new_bias = row_fn(bias.data if isinstance(bias, nn.Parameter) else bias)
             if isinstance(bias, nn.Parameter):
                 bias.data = new_bias
             else:
@@ -654,13 +683,11 @@ def _update_router_for_merge(
             router.n_routed_experts = len(groups)
 
     else:
-        # Standard router. Average grouped router rows instead of copying only
-        # centroid rows, so tokens that routed to merged-away experts can still
-        # reach the merged expert.
-        router.weight.data = merge_expert_rows(router.weight.data)
+        # Standard router.
+        router.weight.data = row_fn(router.weight.data)
 
         if getattr(router, "bias", None) is not None:
-            router.bias.data = merge_expert_rows(router.bias.data)
+            router.bias.data = row_fn(router.bias.data)
 
         router.out_features = len(groups)
 
@@ -684,9 +711,9 @@ def _update_router_for_merge(
         if not isinstance(data, torch.Tensor) or data.ndim == 0:
             continue
         if data.shape[0] >= max(max(g) for g in groups) + 1:
-            merged_value = merge_expert_rows(data)
+            merged_value = row_fn(data)
         elif data.shape[-1] >= max(max(g) for g in groups) + 1:
-            merged_value = merge_expert_columns(data)
+            merged_value = col_fn(data)
         else:
             continue
         if isinstance(value, nn.Parameter):
@@ -711,33 +738,55 @@ def _update_router_for_merge(
     if hasattr(router, "e_score_correction_bias"):
         bias = router.e_score_correction_bias
         if bias.ndim == 1:
-            bias.data = merge_expert_rows(bias.data)
+            bias.data = row_fn(bias.data)
         elif bias.shape[-1] >= max(max(g) for g in groups) + 1:
-            bias.data = merge_expert_columns(bias.data)
+            bias.data = col_fn(bias.data)
 
     if hasattr(moe_block, "moe_statics") and hasattr(moe_block.moe_statics, "e_score_correction_bias"):
         bias = moe_block.moe_statics.e_score_correction_bias
         if bias.shape[-1] >= max(max(g) for g in groups) + 1:
-            bias.data = merge_expert_columns(bias.data)
+            bias.data = col_fn(bias.data)
+
+    # Handle expert_bias directly on the MoE block (Tencent Hy3)
+    if hasattr(moe_block, "expert_bias") and moe_block.expert_bias is not None:
+        bias = moe_block.expert_bias
+        if bias.ndim == 1:
+            bias.data = row_fn(bias.data)
+        elif bias.shape[-1] >= max(max(g) for g in groups) + 1:
+            bias.data = col_fn(bias.data)
 
 
 def merge_model(
     model: nn.Module,
     observer_data: Dict[int, Dict[str, torch.Tensor]],
     config: MergeConfig | None = None,
+    calibration_batches: Iterable[Any] | None = None,
 ) -> Dict[int, int]:
     """
     Merge experts across all MoE layers in a model.
 
+    When ``config.sequential_merging=True`` and ``calibration_batches`` are
+    provided, the function re-runs the forward pass through already-merged
+    layers before collecting statistics for the next layer.  This matches the
+    REAM paper (SamsungSAILMontreal/ream) where each merged layer's effect
+    propagates to subsequent layers' expert activations, improving grouping
+    quality.  Without sequential merging, all layers are grouped based on the
+    original (pre-merge) calibration outputs.
+
     Args:
         model: The model to merge (modified in-place)
-        observer_data: Collected observer statistics per layer
+        observer_data: Collected observer statistics per layer.
+            Ignored when sequential_merging=True with calibration_batches.
         config: Merge configuration
+        calibration_batches: Calibration batches for sequential mode.
 
     Returns:
         Dictionary mapping layer_idx -> number of experts after merging
     """
     config = config or MergeConfig()
+
+    if config.sequential_merging and calibration_batches is not None:
+        return _merge_model_sequential(model, calibration_batches, config)
 
     retained_counts = {}
 
@@ -837,5 +886,73 @@ def merge_model(
             f"Merging complete: {original_avg:.1f} -> {merged_avg:.1f} "
             f"experts per layer ({compression:.0f}% compression)"
         )
+
+    return retained_counts
+
+
+def _merge_model_sequential(
+    model: nn.Module,
+    calibration_batches,
+    config: MergeConfig,
+) -> Dict[int, int]:
+    """
+    Merge experts layer-by-layer, re-running calibration after each layer.
+
+    This implements the sequential merging strategy from the REAM paper
+    (SamsungSAILMontreal/ream).  After layer *i* is merged, the forward
+    pass is re-run through layers 0..*i* so that layer *i*+1's expert
+    activations reflect the already-compressed model.  This improves
+    grouping quality because later layers "see" the merged expert outputs
+    from earlier layers.
+
+    The function re-uses ``merge_layer`` internally and collects fresh
+    observer statistics for each remaining layer.
+    """
+    from ream_moe.observer import MoEObserver, ObserverConfig
+
+    retained_counts: Dict[int, int] = {}
+    from ream_moe.model_utils import list_moe_layers
+    sorted_layers = sorted(list_moe_layers(model))
+
+    if not sorted_layers:
+        logger.warning("No MoE layers found; nothing to merge.")
+        return retained_counts
+
+    for i, layer_idx in enumerate(tqdm(sorted_layers, desc="Merging layers (sequential)")):
+        # Collect fresh observer stats for this layer using the
+        # current (partially-merged) model.
+        device = str(next(model.parameters()).device)
+        obs_cfg = ObserverConfig(
+            max_tokens_per_layer=2048 * 512,
+            device=device,
+        )
+        observer = MoEObserver(model, obs_cfg)
+        observer.hook_model()
+        try:
+            with torch.no_grad():
+                for batch in calibration_batches:
+                    input_ids = getattr(batch, "input_ids", None)
+                    if input_ids is None and isinstance(batch, dict):
+                        input_ids = batch.get("input_ids")
+                    attn_mask = getattr(batch, "attention_mask", None)
+                    if attn_mask is None and isinstance(batch, dict):
+                        attn_mask = batch.get("attention_mask")
+                    if input_ids is not None:
+                        kwargs = {"input_ids": input_ids.to(device)}
+                        if attn_mask is not None:
+                            kwargs["attention_mask"] = attn_mask.to(device)
+                        model(**kwargs)
+        finally:
+            observer.unhook_model()
+
+        layer_stats = observer.get_collected_stats().get(layer_idx)
+        if layer_stats is None:
+            logger.warning(
+                "Layer %d: No observer data collected, skipping.", layer_idx
+            )
+            continue
+
+        retained = merge_layer(model, layer_idx, layer_stats, config)
+        retained_counts[layer_idx] = retained
 
     return retained_counts

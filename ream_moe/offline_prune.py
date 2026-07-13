@@ -435,6 +435,25 @@ def _transform_tensor(
         if tensor.ndim > 0 and tensor.shape[-1] == num_experts:
             return key, tensor.index_select(tensor.ndim - 1, idx)
 
+    # Handle expert_bias on the MoE block directly (Tencent Hy3)
+    for suffix in [".expert_bias"]:
+        if key.endswith(suffix):
+            # Match: model.layers.N.mlp.expert_bias
+            for layer_prefix in layer_prefixes:
+                for moe_path in moe_paths:
+                    pattern = (
+                        rf"^({re.escape(layer_prefix)})\.(\d+)\."
+                        rf"{_moe_regex_part(moe_path)}expert_bias$"
+                    )
+                    match = re.match(pattern, key)
+                    if match:
+                        layer_idx = int(match.group(2))
+                        retained = retained_by_layer[layer_idx]
+                        idx = torch.as_tensor(retained, dtype=torch.long)
+                        if tensor.ndim == 1 and tensor.shape[0] == num_experts:
+                            return key, tensor.index_select(0, idx)
+            break
+
     return key, tensor
 
 

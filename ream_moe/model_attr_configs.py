@@ -365,6 +365,24 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts_per_tok": "text_config.top_k_experts",
     },
 
+    # Tencent Hy3 (https://huggingface.co/tencent/Hy3)
+    # 80-layer MoE, 192 routed experts + 1 shared expert, sigmoid router, top_k=8.
+    # Layer 0 is dense (first_k_dense_replace=1). Router is nested: router.gate.
+    # Expert bias is per-layer: model.layers.N.mlp.expert_bias.
+    "HYV3ForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "router",
+        "router_weight_attr": "gate.weight",
+        "router_expert_attrs": ["expert_bias"],
+        "num_experts": "config.num_experts",
+        "num_experts_per_tok": "config.num_experts_per_tok",
+    },
+
     # gpt-oss models (OpenAI-like architecture)
     "gpt-oss-20b": {
         "moe_block": "mlp",

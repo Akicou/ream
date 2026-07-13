@@ -235,6 +235,11 @@ def prune_layer(
     else:
         _prune_separate_experts(moe_block, retained_indices, attrs)
 
+    # Handle expert_bias directly on the MoE block (Tencent Hy3)
+    if hasattr(moe_block, "expert_bias") and moe_block.expert_bias is not None:
+        idx_tensor = torch.as_tensor(retained_indices, device=moe_block.expert_bias.device)
+        moe_block.expert_bias.data = moe_block.expert_bias.data[idx_tensor]
+
     _sync_expert_count_metadata(moe_block, len(retained_indices), attrs)
 
     return len(retained_indices)

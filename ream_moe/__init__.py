@@ -22,8 +22,8 @@ Basic usage:
     ```python
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from ream_moe import observe_model, prune_model, merge_model, setup_logging
-    from ream_moe.pruning import PruningConfig
-    from ream_moe.merging import MergeConfig
+    from ream_moe.prune import PruningConfig
+    from ream_moe.merge import MergeConfig
 
     # Optional: suppress INFO logs
     setup_logging(level="WARNING")
@@ -191,4 +191,15 @@ __all__.extend([
     "ensure_model_registered",
     "verify_model_config",
     "print_verification_result",
+])
+
+# Unified high-level API
+from ream_moe.ream import (
+    REAMConfig,
+    REAMCompressor,
+)
+
+__all__.extend([
+    "REAMConfig",
+    "REAMCompressor",
 ])
