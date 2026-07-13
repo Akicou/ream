@@ -747,13 +747,15 @@ def _update_router_for_merge(
         if bias.shape[-1] >= max(max(g) for g in groups) + 1:
             bias.data = col_fn(bias.data)
 
-    # Handle expert_bias directly on the MoE block (Tencent Hy3)
-    if hasattr(moe_block, "expert_bias") and moe_block.expert_bias is not None:
-        bias = moe_block.expert_bias
-        if bias.ndim == 1:
-            bias.data = row_fn(bias.data)
-        elif bias.shape[-1] >= max(max(g) for g in groups) + 1:
-            bias.data = col_fn(bias.data)
+    # Handle e_score_correction_bias / expert_bias on the MoE block (Tencent Hy3, Ernie, etc.)
+    for bias_attr in ("e_score_correction_bias", "expert_bias"):
+        if hasattr(moe_block, bias_attr):
+            bias = getattr(moe_block, bias_attr)
+            if bias is not None and isinstance(bias, torch.Tensor):
+                if bias.ndim == 1:
+                    bias.data = row_fn(bias.data)
+                elif bias.shape[-1] >= max(max(g) for g in groups) + 1:
+                    bias.data = col_fn(bias.data)
 
 
 def merge_model(
