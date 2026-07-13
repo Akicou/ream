@@ -8,6 +8,7 @@
 
 ## Releases
  - [Akicou/Qwen3-30B-A3B-Instruct-REAMINI](https://huggingface.co/Akicou/Qwen3-30B-A3B-Instruct-REAMINI)
+ - [Akicou/Hy3-REAM-100B](https://huggingface.co/Akicou/Hy3-REAM-100B) — Tencent Hy3 300B→100B
 ## Features
 
 - **Adapter-based design** - Small `MoEAdapter` interface hides model-specific details
@@ -30,6 +31,7 @@
   - LongCat (LongcatCausalLM, LongcatForCausalLM)
   - MiniMax (MiniMaxM2ForCausalLM, MiniMaxM3Sparse)
   - DiffusionGemma (DiffusionGemmaForBlockDiffusion)
+  - Tencent Hy3 (HYV3ForCausalLM)
 - **Multiple compression methods**:
   - Expert pruning (remove low-saliency experts)
   - Expert merging (combine similar experts)
@@ -142,6 +144,7 @@ retained_counts = merge_model(model, observer_data, config)
 | MiniMax M2.5 | `MiniMaxM2ForCausalLM` | No | Text-only, w1/w2/w3 naming |
 | MiniMax M3 | `MiniMaxM3SparseForConditionalGeneration` | No | 128 experts, top_k=4, multimodal, shared experts, e_score_correction_bias |
 | DiffusionGemma 26B-A4B | `DiffusionGemmaForBlockDiffusion` | Yes | Experts live directly on `model.decoder.layers.*` |
+| Tencent Hy3 | `HYV3ForCausalLM` | Yes | 192 experts, top_k=8, fused gate_up_proj, shared experts, sigmoid router, MTP layer |
 
 ## Calibration Datasets
 
