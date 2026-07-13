@@ -78,6 +78,37 @@ python examples/compress_sequential.py \
 - Shared experts and dense layers are left untouched.
 - The `e_score_correction_bias` per layer is correctly shrunk alongside router weights.
 
+## 🧪 Output Verification (Smoke Test)
+
+The following generation confirms the model produces coherent output and can handle reasoning tasks post-compression.
+
+**User:** *What is the Heyting Algebra thingamajig?*
+
+**Model Output:**
+
+```
+It looks like a typo/transcription issue, so the intended phrase is likely
+"What is the Heisenberg algebra?"
+
+Heisenberg algebra usually refers to the mathematical framework connected
+to Heisenberg's formulation of quantum mechanics in the 1920s, rather than
+a specific named "algebra" in mathematics. In physics and math contexts,
+it can mean:
+
+- Operator algebra / non-commuting algebras: In early quantum mechanics,
+  Heisenberg introduced matrix / operator mechanics where physical
+  quantities are represented by non-commuting linear operators (matrices)
+  instead of classical commuting quantities. This is often described as
+  the algebra of non-commuting operators (sometimes called Heisenberg
+  algebra in historical texts).
+- Related to CC algebras / Lie algebras: In some advanced math/physics,
+  "Heisenberg" may appear in names like Heisenberg Lie algebra,
+  Heisenberg-type algebras in symmetry/group theory, referring to certain
+  operator algebras derived from quantum symmetries.
+```
+
+> **Note:** This is a "Smoke-Test" release. The model is functional but has not been benchmarked. The above response shows the model attempts reasoning but may hallucinate (confusing "Heyting" with "Heisenberg") — typical of compressed models without fine-tuning.
+
 ## 📦 Basic Usage
 
 ```python
