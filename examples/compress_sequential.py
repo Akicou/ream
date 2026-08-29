@@ -144,6 +144,8 @@ def main():
     parser.add_argument("--group-size", type=int, default=16)
     parser.add_argument("--cpu-merge", action="store_true")
     parser.add_argument("--fast-merge", action="store_true")
+    parser.add_argument("--max-memory-per-gpu", type=str, default="60GiB",
+                        help="max memory per GPU for device_map (leaves headroom for the observer)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -154,10 +156,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     logger.info("Loading model: %s", args.model)
+    max_memory = {i: args.max_memory_per_gpu for i in range(torch.cuda.device_count())}
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         device_map="auto",
+        max_memory=max_memory,
         trust_remote_code=True,
     )
     model.eval()
