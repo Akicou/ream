@@ -394,6 +394,37 @@ MODEL_ATTRS: Dict[str, Dict[str, Any]] = {
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+
+    # Qwen4-Exp / Qwen3.8-Flash-Next (hybrid linear + full/sparse attention MoE).
+    # Fused experts (gate_up_proj [E, 2*I, H] + down_proj [E, H, I]), top-k
+    # softmax router. Qwen4ExpForCausalLM is the text-only variant: decoder
+    # layers live at model.model.layers and the expert count sits flat on config.
+    "Qwen4ExpForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+
+    # Qwen4-Exp multimodal wrapper: decoder layers live at
+    # model.model.language_model.layers and the text config is nested under
+    # text_config (Qwen/Qwen3.8-Flash-Next).
+    "Qwen4ExpForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "text_config.num_experts",
+        "num_experts_per_tok": "text_config.num_experts_per_tok",
+    },
 }
 
 

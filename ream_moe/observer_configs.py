@@ -313,6 +313,26 @@ OBSERVER_CONFIG_REGISTRY: Dict[str, type[ObserverHookConfig]] = {
             "module_class_name_to_hook_regex": "MoE",
         },
     ),
+
+    # Qwen4-Exp / Qwen3.8-Flash-Next (fused expert tensors, top-k softmax router)
+    "Qwen4ExpForCausalLM": type(
+        "Qwen4ExpObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "Qwen4ExpTextSparseMoeBlock",
+            "fused_experts": True,
+        },
+    ),
+    "Qwen4ExpForConditionalGeneration": type(
+        "Qwen4ExpConditionalGenObserverConfig",
+        (ObserverHookConfig,),
+        {
+            "module_class_name_to_hook_regex": "Qwen4ExpTextSparseMoeBlock",
+            "num_experts_attr_name": "text_config.num_experts",
+            "top_k_attr_name": "text_config.num_experts_per_tok",
+            "fused_experts": True,
+        },
+    ),
 }
 
 

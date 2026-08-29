@@ -53,8 +53,10 @@ def _get_layers(model: nn.Module) -> Any:
     """Find the decoder layer container across common HF model wrappers."""
     for path in [
         "model.layers",
+        "model.model.layers",
         "model.language_model.model.layers",
         "model.language_model.layers",
+        "model.model.language_model.layers",
         "layers",
         "model.decoder.layers",
         "decoder.layers",
